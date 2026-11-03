@@ -7,7 +7,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use checkpoint::{
     certifier::{CheckpointCertifier, CheckpointTimings},
-    checkpoint::Checkpoint,
+    checkpoint::{Checkpoint, Outcome},
+    finality::FinalityProtocol,
 };
 use dag::{
     authority::Authority, block::transaction::Transaction as ConsensusTransaction,
@@ -15,8 +16,7 @@ use dag::{
     sync::network::Network,
 };
 use execution::{
-    crypto::Digest, engine::ExecutionEngine, scheduler::SequentialScheduler,
-    transaction::Transaction,
+    engine::ExecutionEngine, scheduler::SequentialScheduler, transaction::Transaction,
 };
 use prometheus::Registry;
 use replica::{
@@ -31,6 +31,7 @@ use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
     metrics::ValidatorMetrics,
+    parameters::ValidatorParameters,
 };
 
 /// Capacity of the commit stream; a bounded channel is mandatory — a slow consumer must
@@ -48,6 +49,7 @@ pub struct ValidatorBuilder<E> {
     /// The consensus WAL to replay on start; `None` for ephemeral storage.
     wal: Option<PathBuf>,
     registry: Registry,
+    parameters: ValidatorParameters,
     replica: ReplicaBuilder,
 }
 
@@ -65,6 +67,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             // The replica defaults to WAL storage at this path when `with_storage` is not called.
             wal: Some(private_config.wal()),
             registry: Registry::new(),
+            parameters: ValidatorParameters::default(),
             replica: ReplicaBuilder::new(authority, public_config, private_config),
         }
     }
@@ -100,21 +103,34 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
         self
     }
 
+    pub fn with_parameters(mut self, parameters: ValidatorParameters) -> Self {
+        self.parameters = parameters;
+        self
+    }
+
     /// Assembles the validator: builds the scheduler, the certifier, and the replica with its
     /// commit consumer. No I/O happens until [`Validator::start`].
     pub fn build(self) -> eyre::Result<Validator<E>> {
         let (sender, receiver) = mpsc::channel(COMMIT_CHANNEL_CAPACITY);
         let committee = self.public_config.committee();
-        let protocol = self
+        let quorum = self
             .public_config
             .parameters
             .consensus
-            .to_protocol(&committee)?;
-        let certifier = CheckpointCertifier::new(committee, protocol.quorum_threshold);
+            .to_protocol(&committee)?
+            .quorum_threshold;
+        let finality = self.parameters.finality;
+        // The certifier derives f+1 from the quorum, exactly for 2f+1 quorums only.
+        eyre::ensure!(
+            finality == FinalityProtocol::Baseline || quorum == 2 * committee.total_stake() / 3 + 1,
+            "finality protocol {finality} needs a 2f+1 consensus quorum (no hybrid protocols)"
+        );
+        let certifier = CheckpointCertifier::new(committee, finality, quorum);
         Ok(Validator {
             state: ExecutionState {
                 scheduler: SequentialScheduler::new(self.engine),
                 certifier,
+                minted: 0,
             },
             authority: self.authority,
             public_config: self.public_config,
@@ -142,6 +158,8 @@ pub struct Validator<E> {
 struct ExecutionState<E> {
     scheduler: SequentialScheduler<E>,
     certifier: CheckpointCertifier,
+    /// Checkpoints minted so far: the height of the latest one.
+    minted: u64,
 }
 
 impl<E: ExecutionEngine + Send + 'static> Validator<E> {
@@ -163,12 +181,12 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let replica = replica.run::<C>().await?;
         let client = replica.transaction_client();
         let (executed_sender, executed) = watch::channel(replayed);
-        let (certified_sender, certified) = watch::channel(state.certification_status());
+        let (decided_sender, decided) = watch::channel(state.decided_everything());
         let driver_metrics = metrics.clone();
         let driver = C::spawn(async move {
-            // Re-attest checkpoints uncertified at replay: votes in flight at shutdown died
+            // Re-attest checkpoints undecided at replay: votes in flight at shutdown died
             // with the transaction queue, and a validator otherwise attests only once, so an
-            // uncertified checkpoint could stall forever. The certifier's per-author dedupe
+            // undecided checkpoint could stall forever. The certifier's per-author dedupe
             // makes resubmission idempotent — votes that did commit are simply ignored.
             let pending: Vec<_> = state.certifier.pending().cloned().collect();
             if !pending.is_empty() {
@@ -192,7 +210,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 driver_metrics.observe_subdag_execution_latency(C::elapsed(&start));
                 count += executed as u64;
                 let _ = executed_sender.send(count);
-                let _ = certified_sender.send(state.certification_status());
+                let _ = decided_sender.send(state.decided_everything());
                 // Attest to the minted checkpoint through consensus: the vote rides this
                 // validator's own signed blocks. Failure is benign — the replica is shutting
                 // down, and lost votes are resubmitted after replay.
@@ -210,7 +228,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             replica,
             driver,
             executed,
-            certified,
+            decided,
             metrics,
             max_block_size,
         })
@@ -306,6 +324,7 @@ impl<E: ExecutionEngine> ExecutionState<E> {
             });
         let executed = self.scheduler.execute(transactions).len();
         let minted = (executed > 0).then(|| {
+            self.minted += 1;
             let timings = CheckpointTimings {
                 minted_at: now,
                 mean_timestamp_ms: stamp_sum_ms / executed as u64,
@@ -317,25 +336,25 @@ impl<E: ExecutionEngine> ExecutionState<E> {
         // A vote can never reference its own delivering sub-dag's checkpoint (it is created
         // only after that sub-dag commits), so recording after minting loses nothing.
         for (author, vote) in votes {
-            if let Some(timings) = self.certifier.record(anchor, author, vote) {
+            if let Some((outcome, timings)) = self.certifier.record(anchor, author, vote) {
                 metrics.observe_checkpoint_certification_latency(
+                    outcome,
                     now.saturating_sub(timings.minted_at),
                 );
-                let submitted = Duration::from_millis(timings.mean_timestamp_ms);
-                metrics.observe_end_to_end_latency(now.saturating_sub(submitted));
+                // Skipped transactions are never finalized.
+                if let Outcome::Finalize(_) = outcome {
+                    let submitted = Duration::from_millis(timings.mean_timestamp_ms);
+                    metrics.observe_end_to_end_latency(now.saturating_sub(submitted));
+                }
             }
         }
         (executed, minted)
     }
 
-    /// The pair consumed by [`ValidatorHandle::wait_for_certified`]: the highest certified
-    /// commitment beside the store commitment at the same instant.
-    fn certification_status(&self) -> (Option<Digest>, Digest) {
-        let certified = self
-            .certifier
-            .highest_certified()
-            .map(|certificate| certificate.checkpoint().commitment());
-        (certified, self.scheduler.store().commitment())
+    /// Whether every minted checkpoint is decided, once one was minted; consumed by
+    /// [`ValidatorHandle::wait_for_decided`].
+    fn decided_everything(&self) -> bool {
+        self.minted > 0 && self.certifier.pending().next().is_none()
     }
 }
 
@@ -348,7 +367,7 @@ pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
     replica: ReplicaHandle<C>,
     driver: C::JoinHandle<(SequentialScheduler<E>, CheckpointCertifier)>,
     executed: watch::Receiver<u64>,
-    certified: watch::Receiver<(Option<Digest>, Digest)>,
+    decided: watch::Receiver<bool>,
     metrics: Arc<ValidatorMetrics>,
     max_block_size: usize,
 }
@@ -408,18 +427,17 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
         }
     }
 
-    /// Waits until everything executed is certified: the highest certified commitment equals
-    /// the store commitment. Equality is transient while submissions are in flight, so this is
-    /// meaningful after an executed-count cut ([`wait_for_transactions`]
-    /// (ValidatorHandle::wait_for_transactions) first). Returns early if the driver has
-    /// stopped.
-    pub async fn wait_for_certified(&mut self) {
+    /// Waits until everything executed is decided (finalized or skipped): no minted checkpoint
+    /// is pending. This is transient while submissions are in flight, so it is meaningful after
+    /// an executed-count cut ([`wait_for_transactions`](ValidatorHandle::wait_for_transactions)
+    /// first). Never resolves if a height cannot be decided, as under the baseline protocol
+    /// with forked validators. Returns early if the driver has stopped.
+    pub async fn wait_for_decided(&mut self) {
         loop {
-            let (certified, store) = *self.certified.borrow_and_update();
-            if certified == Some(store) {
+            if *self.decided.borrow_and_update() {
                 return;
             }
-            if self.certified.changed().await.is_err() {
+            if self.decided.changed().await.is_err() {
                 return;
             }
         }
@@ -443,12 +461,17 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{path::Path, sync::Arc, time::Duration};
 
-    use checkpoint::certifier::CheckpointCertifier;
+    use checkpoint::{
+        certifier::CheckpointCertifier,
+        checkpoint::{Checkpoint, Decision, Outcome},
+        finality::FinalityProtocol,
+    };
     use dag::{
         authority::Authority,
         block::{Block, data::Data, transaction::Transaction as ConsensusTransaction},
+        config::ImportExport,
         consensus::CommittedSubDag,
         crypto::CryptoEngine,
     };
@@ -458,18 +481,32 @@ mod tests {
         scheduler::SequentialScheduler,
     };
     use prometheus::Registry;
+    use replica::config::{PrivateReplicaConfig, PublicReplicaConfig, ReplicaParameters};
 
     use crate::{
         envelope::{Envelope, Payload},
-        metrics::ValidatorMetrics,
-        validator::ExecutionState,
+        metrics::{FINALIZE, ValidatorMetrics},
+        parameters::ValidatorParameters,
+        validator::{ExecutionState, ValidatorBuilder},
     };
 
     fn state() -> ExecutionState<FakeExecutor> {
         ExecutionState {
             scheduler: SequentialScheduler::new(FakeExecutor),
-            certifier: CheckpointCertifier::new_for_test(vec![1; 4], 3, 0),
+            certifier: CheckpointCertifier::new_for_test(
+                FinalityProtocol::Baseline,
+                vec![1; 4],
+                3,
+                0,
+            ),
+            minted: 0,
         }
+    }
+
+    /// Whether `decision` finalized `checkpoint`.
+    fn finalizes(decision: &Decision, checkpoint: &Checkpoint) -> bool {
+        decision.anchor() == checkpoint.anchor()
+            && decision.outcome() == Outcome::Finalize(checkpoint.commitment())
     }
 
     fn metrics() -> Arc<ValidatorMetrics> {
@@ -535,6 +572,31 @@ mod tests {
     }
 
     #[test]
+    fn protocol_a_rejects_consensus_quorums_other_than_2f_plus_1() {
+        // Hybrid Mysticeti with no fault budget waits for all 4 validators, not 2f+1 = 3.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let consensus = "consensus:\n  protocol: hybrid-mysticeti\n  f: 0\n  c: 0\n";
+        std::fs::write(file.path(), consensus).unwrap();
+        let replica_parameters = ReplicaParameters::load(file.path()).unwrap();
+        let public_config =
+            PublicReplicaConfig::new_for_tests(4).with_parameters(replica_parameters);
+        let build = |finality| {
+            let private_config =
+                PrivateReplicaConfig::new_for_benchmarks(Path::new("unused"), 4).remove(0);
+            ValidatorBuilder::new(
+                FakeExecutor,
+                Authority::new(0),
+                public_config.clone(),
+                private_config,
+            )
+            .with_parameters(ValidatorParameters { finality })
+            .build()
+        };
+        assert!(build(FinalityProtocol::A).is_err());
+        assert!(build(FinalityProtocol::Baseline).is_ok());
+    }
+
+    #[test]
     fn a_quorum_of_attestations_certifies_and_mints_nothing() {
         let mut state = state();
         let metrics = metrics();
@@ -566,15 +628,15 @@ mod tests {
         assert!(minted.is_none());
         let certified = state
             .certifier
-            .highest_certified()
+            .highest_decided()
             .expect("quorum must certify");
-        assert_eq!(certified.checkpoint(), &checkpoint);
+        assert!(finalizes(certified, &checkpoint));
         // The proof records the delivering sub-dag's anchor per counted vote.
         assert_eq!(certified.proof(), [anchor; 3]);
         assert!(state.certifier.pending().next().is_none());
         // Certification closed the latency metrics: minted at 1s and certified at 4s, with a
         // mean submission stamp of 2s.
-        let certification = metrics.checkpoint_certification_latency_s();
+        let certification = metrics.checkpoint_certification_latency_s(FINALIZE);
         assert_eq!(certification.get_sample_count(), 1);
         assert_eq!(certification.get_sample_sum(), 3.0);
         let end_to_end = metrics.end_to_end_latency_s();
@@ -608,9 +670,9 @@ mod tests {
         let second = minted.expect("the update must mint a second checkpoint");
         let certified = state
             .certifier
-            .highest_certified()
+            .highest_decided()
             .expect("quorum must certify");
-        assert_eq!(certified.checkpoint(), &checkpoint);
+        assert!(finalizes(certified, &checkpoint));
         // The prior checkpoint certified and was reclaimed; only the new mint is pending.
         assert_eq!(state.certifier.pending().count(), 1);
 
@@ -623,7 +685,7 @@ mod tests {
             })
             .collect();
         state.execute_subdag(&metrics, Duration::from_secs(6), subdag_at(3, votes));
-        let certification = metrics.checkpoint_certification_latency_s();
+        let certification = metrics.checkpoint_certification_latency_s(FINALIZE);
         assert_eq!(certification.get_sample_count(), 2);
         assert_eq!(certification.get_sample_sum(), 2.0 + 4.0);
         let end_to_end = metrics.end_to_end_latency_s();

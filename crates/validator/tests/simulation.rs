@@ -7,7 +7,7 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use checkpoint::certifier::CheckpointCertifier;
+use checkpoint::{certifier::CheckpointCertifier, checkpoint::Outcome};
 use dag::{authority::Authority, context::Ctx, metrics::Metrics};
 use execution::{
     fake::{FakeExecutor, FakeTransaction},
@@ -26,6 +26,7 @@ use simulator::{
 };
 use validator::{
     generator::LoadGeneratorConfig,
+    metrics::FINALIZE,
     validator::{ValidatorBuilder, ValidatorHandle},
 };
 
@@ -102,10 +103,10 @@ impl SimulatedTestbed {
         }
     }
 
-    /// Waits until everything executed is certified; call after an executed-count cut.
-    async fn wait_for_certified(&mut self) {
+    /// Waits until everything executed is decided; call after an executed-count cut.
+    async fn wait_for_decided(&mut self) {
         for validator in &mut self.validators {
-            validator.wait_for_certified().await;
+            validator.wait_for_decided().await;
         }
     }
 
@@ -189,7 +190,7 @@ fn run_once(seed: u64) -> RunOutcome {
                 break;
             }
         }
-        committee.wait_for_certified().await;
+        committee.wait_for_decided().await;
         // Metric (b) observes every delivered sub-dag. Values are zero under simulated time
         // (execution advances no simulated clock), so only population is meaningful.
         let mut delivered = Vec::with_capacity(COMMITTEE_SIZE);
@@ -203,14 +204,16 @@ fn run_once(seed: u64) -> RunOutcome {
 
             // Certification and end-to-end latencies derive from simulated clocks, so their
             // magnitudes are meaningful; each certified checkpoint observes both once.
-            let certification = validator.metrics().checkpoint_certification_latency_s();
+            let certification = validator
+                .metrics()
+                .checkpoint_certification_latency_s(FINALIZE);
             let end_to_end = validator.metrics().end_to_end_latency_s();
             assert!(certification.get_sample_count() > 0);
             assert_eq!(
                 end_to_end.get_sample_count(),
                 certification.get_sample_count()
             );
-            for (name, histogram) in [("certification", certification), ("e2e", end_to_end)] {
+            for (name, histogram) in [("certification", &certification), ("e2e", end_to_end)] {
                 let mean = histogram.get_sample_sum() / histogram.get_sample_count() as f64;
                 assert!(
                     mean > 0.0 && mean < 10.0,
@@ -247,14 +250,14 @@ fn validators_converge_under_simulation() {
     let (reference, certifier) = &results[0];
     let store = reference.store();
     let certified = certifier
-        .highest_certified()
+        .highest_decided()
         .expect("everything executed is certified");
-    assert_eq!(certified.checkpoint().commitment(), store.commitment());
+    assert_eq!(certified.outcome(), Outcome::Finalize(store.commitment()));
     // Certification is a deterministic function of the commit stream: every validator holds
     // the same byte-identical certificate and an empty pending window.
     for (scheduler, other) in &results {
         assert_eq!(scheduler.store(), store);
-        assert_eq!(other.highest_certified(), Some(certified));
+        assert_eq!(other.highest_decided(), Some(certified));
         assert!(other.pending().next().is_none());
     }
     // Every validator's coupled object was created and modified at least once.
@@ -282,8 +285,8 @@ fn simulation_is_deterministic_per_seed() {
                 "seed {seed} produced diverging stores"
             );
             assert_eq!(
-                a_certifier.highest_certified(),
-                b_certifier.highest_certified(),
+                a_certifier.highest_decided(),
+                b_certifier.highest_decided(),
                 "seed {seed} produced diverging certificates"
             );
         }

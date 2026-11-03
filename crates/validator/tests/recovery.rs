@@ -8,12 +8,14 @@
 
 mod common;
 
+use checkpoint::checkpoint::Outcome;
 use common::Testbed;
 use execution::{
     fake::FakeTransaction,
     object::{ObjectId, Version},
     store::StateView,
 };
+use validator::metrics::FINALIZE;
 
 const STATE_UPDATES: usize = 3;
 
@@ -33,7 +35,7 @@ async fn restarted_committee_recovers_execution_state() {
     testbed.wait_for_transactions(total).await;
     // Halt only once everything is certified: the run then loses no in-flight votes, so
     // replay alone rebuilds the certified watermark (re-attestation is a separate concern).
-    testbed.wait_for_certified().await;
+    testbed.wait_for_decided().await;
     let references = testbed.shutdown().await;
 
     // Restart on the same WALs: replay must rebuild the executed count and the certified
@@ -41,10 +43,12 @@ async fn restarted_committee_recovers_execution_state() {
     // which mint nothing.
     let mut testbed = Testbed::start_with_wal(dir.path(), 3200).await;
     testbed.wait_for_transactions(total).await;
-    testbed.wait_for_certified().await;
+    testbed.wait_for_decided().await;
     // Replay records nothing: the pre-restart certifications must not re-observe.
     for validator in testbed.validators() {
-        let certification = validator.metrics().checkpoint_certification_latency_s();
+        let certification = validator
+            .metrics()
+            .checkpoint_certification_latency_s(FINALIZE);
         assert_eq!(certification.get_sample_count(), 0);
     }
 
@@ -52,10 +56,12 @@ async fn restarted_committee_recovers_execution_state() {
     let update = FakeTransaction::success(vec![], vec![], vec![id]).into();
     testbed.submit(0, vec![update]).await;
     testbed.wait_for_transactions(total + 1).await;
-    testbed.wait_for_certified().await;
+    testbed.wait_for_decided().await;
     // Exactly the post-restart checkpoint observes.
     for validator in testbed.validators() {
-        let certification = validator.metrics().checkpoint_certification_latency_s();
+        let certification = validator
+            .metrics()
+            .checkpoint_certification_latency_s(FINALIZE);
         assert_eq!(certification.get_sample_count(), 1);
     }
     let rebuilt = testbed.shutdown().await;
@@ -77,18 +83,18 @@ async fn restarted_committee_recovers_execution_state() {
         // Replay rebuilt the certified watermark from the WAL's ordered votes, and the
         // post-restart checkpoint certified on top of it.
         let reference_certified = reference_certifier
-            .highest_certified()
+            .highest_decided()
             .expect("first run halts certified");
         let rebuilt_certified = rebuilt_certifier
-            .highest_certified()
+            .highest_decided()
             .expect("restarted run halts certified");
         assert_eq!(
-            reference_certified.checkpoint().commitment(),
-            reference.store().commitment()
+            reference_certified.outcome(),
+            Outcome::Finalize(reference.store().commitment())
         );
         assert_eq!(
-            rebuilt_certified.checkpoint().commitment(),
-            rebuilt.store().commitment()
+            rebuilt_certified.outcome(),
+            Outcome::Finalize(rebuilt.store().commitment())
         );
         assert!(rebuilt_certified.round() > reference_certified.round());
     }
@@ -97,8 +103,8 @@ async fn restarted_committee_recovers_execution_state() {
     for (scheduler, certifier) in &rebuilt {
         assert_eq!(scheduler.store(), store);
         assert_eq!(
-            certifier.highest_certified(),
-            first_certifier.highest_certified()
+            certifier.highest_decided(),
+            first_certifier.highest_decided()
         );
         assert!(certifier.pending().next().is_none());
     }
@@ -132,20 +138,20 @@ async fn restarted_committee_recertifies_lost_votes() {
     // here stalls forever if any lost vote is not resubmitted.
     let mut testbed = Testbed::start_with_wal(dir.path(), 3400).await;
     testbed.wait_for_transactions(total).await;
-    testbed.wait_for_certified().await;
+    testbed.wait_for_decided().await;
     let rebuilt = testbed.shutdown().await;
 
     let (first, first_certifier) = &rebuilt[0];
     let store = first.store();
     let certified = first_certifier
-        .highest_certified()
+        .highest_decided()
         .expect("everything executed is certified");
-    assert_eq!(certified.checkpoint().commitment(), store.commitment());
+    assert_eq!(certified.outcome(), Outcome::Finalize(store.commitment()));
     for (scheduler, certifier) in &rebuilt {
         assert_eq!(scheduler.store(), store);
         assert_eq!(
-            certifier.highest_certified(),
-            first_certifier.highest_certified()
+            certifier.highest_decided(),
+            first_certifier.highest_decided()
         );
         assert!(certifier.pending().next().is_none());
     }

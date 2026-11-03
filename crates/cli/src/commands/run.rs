@@ -11,7 +11,9 @@ use replica::{
     prometheus::{MetricsRegistry, PrometheusServer},
 };
 use tracing_subscriber::filter::LevelFilter;
-use validator::{generator::LoadGeneratorConfig, validator::ValidatorBuilder};
+use validator::{
+    generator::LoadGeneratorConfig, parameters::ValidatorParameters, validator::ValidatorBuilder,
+};
 
 use crate::{args::RunArgs, tracing::ValidatorTracing};
 
@@ -32,6 +34,7 @@ pub async fn run(
         public_config_path,
         private_config_path,
         load_generator_config_path,
+        validator_parameters_path,
     } = args;
     tracing::info!("Starting validator {authority}");
 
@@ -40,6 +43,11 @@ pub async fn run(
     let load_generator_config = load_generator_config_path
         .map(|path| LoadGeneratorConfig::load(&path))
         .transpose()?;
+    let parameters = validator_parameters_path
+        .map(|path| ValidatorParameters::load(&path))
+        .transpose()?
+        .unwrap_or_default();
+    tracing::info!("Finality protocol: {}", parameters.finality);
 
     // Resolve this authority's network and metrics addresses from the public config.
     let metrics_address = public_config
@@ -64,6 +72,7 @@ pub async fn run(
     let registry = MetricsRegistry::new();
     let handle = ValidatorBuilder::new(FakeExecutor, authority, public_config, private_config)
         .with_registry(registry.clone())
+        .with_parameters(parameters)
         .build()?
         .start::<TokioCtx>()
         .await?;

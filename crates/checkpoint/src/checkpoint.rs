@@ -44,21 +44,42 @@ impl Checkpoint {
     }
 }
 
-/// A checkpoint a quorum of stake attested to: the committee's agreement on the execution
-/// state at that point.
+/// What the committee decided at one checkpoint height.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Outcome {
+    /// The committee agrees on the execution state at this height.
+    Finalize(Digest),
+    /// No commitment can gather enough support; the height is passed over.
+    Skip,
+}
+
+/// A decided checkpoint height: its outcome and the delivering sub-dag of each vote backing it.
 #[derive(PartialEq, Debug)]
-pub struct CertifiedCheckpoint {
-    checkpoint: Checkpoint,
+pub struct Decision {
+    anchor: BlockReference,
+    outcome: Outcome,
     proof: Vec<BlockReference>,
 }
 
-impl CertifiedCheckpoint {
-    pub(crate) fn new(checkpoint: Checkpoint, proof: Vec<BlockReference>) -> Self {
-        Self { checkpoint, proof }
+impl Decision {
+    pub(crate) fn new(
+        anchor: BlockReference,
+        outcome: Outcome,
+        proof: Vec<BlockReference>,
+    ) -> Self {
+        Self {
+            anchor,
+            outcome,
+            proof,
+        }
     }
 
-    pub fn checkpoint(&self) -> &Checkpoint {
-        &self.checkpoint
+    pub fn anchor(&self) -> BlockReference {
+        self.anchor
+    }
+
+    pub fn outcome(&self) -> Outcome {
+        self.outcome
     }
 
     pub fn proof(&self) -> &[BlockReference] {
@@ -66,6 +87,6 @@ impl CertifiedCheckpoint {
     }
 
     pub fn round(&self) -> u64 {
-        self.checkpoint.round()
+        self.anchor.round
     }
 }

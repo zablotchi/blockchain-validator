@@ -20,28 +20,30 @@ use orchestrator::{
 };
 use replica::config::{PublicReplicaConfig, ReplicaParameters};
 use serde::{Deserialize, Serialize};
-use validator::generator::LoadGeneratorConfig;
+use validator::{generator::LoadGeneratorConfig, parameters::ValidatorParameters};
 
 const PUBLIC_REPLICA_CONFIG_FILENAME: &str = PublicReplicaConfig::DEFAULT_FILENAME;
 const LOAD_GENERATOR_CONFIG_FILENAME: &str = LoadGeneratorConfig::DEFAULT_FILENAME;
+const VALIDATOR_PARAMETERS_FILENAME: &str = ValidatorParameters::DEFAULT_FILENAME;
 
-/// The replica parameters distributed to every validator. The `Debug` output keys the
-/// benchmark's measurement files, so it must stay short and filesystem-safe.
+/// The parameters distributed to every validator: the replica's and the validator's, side by
+/// side in one flat file. The `Debug` output keys the benchmark's measurement files, so it
+/// must stay short and filesystem-safe.
 #[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(transparent)]
-pub struct NodeParameters(ReplicaParameters);
-
-impl Deref for NodeParameters {
-    type Target = ReplicaParameters;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub struct NodeParameters {
+    #[serde(flatten)]
+    replica: ReplicaParameters,
+    #[serde(flatten)]
+    validator: ValidatorParameters,
 }
 
 impl Debug for NodeParameters {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.consensus)
+        write!(
+            f,
+            "{:?}-{}",
+            self.replica.consensus, self.validator.finality
+        )
     }
 }
 
@@ -108,12 +110,20 @@ impl ProtocolCommands for ValidatorProtocol {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let replica_parameters = parameters.node_parameters.clone();
-        let replica_parameters_string = serde_yaml::to_string(&replica_parameters).unwrap();
+        let replica_parameters = &parameters.node_parameters.replica;
+        let replica_parameters_string = serde_yaml::to_string(replica_parameters).unwrap();
         let replica_parameters_path = self.working_dir.join("replica-parameters.yaml");
         let upload_replica_parameters = format!(
             "echo -e '{replica_parameters_string}' > {}",
             replica_parameters_path.display()
+        );
+
+        let validator_parameters = &parameters.node_parameters.validator;
+        let validator_parameters_string = serde_yaml::to_string(validator_parameters).unwrap();
+        let validator_parameters_path = self.working_dir.join(VALIDATOR_PARAMETERS_FILENAME);
+        let upload_validator_parameters = format!(
+            "echo -e '{validator_parameters_string}' > {}",
+            validator_parameters_path.display()
         );
 
         let mut load_generator_config = parameters.client_parameters.clone();
@@ -139,6 +149,7 @@ impl ProtocolCommands for ValidatorProtocol {
         [
             "source $HOME/.cargo/env",
             &upload_replica_parameters,
+            &upload_validator_parameters,
             &upload_load_generator_config,
             &genesis,
         ]
@@ -169,6 +180,8 @@ impl ProtocolCommands for ValidatorProtocol {
                     .join(format!("private-replica-config-{authority}.yaml"));
                 let load_generator_config_path =
                     self.working_dir.join(LOAD_GENERATOR_CONFIG_FILENAME);
+                let validator_parameters_path =
+                    self.working_dir.join(VALIDATOR_PARAMETERS_FILENAME);
 
                 let mut run = vec![
                     format!("./{BINARY_PATH}/validator"),
@@ -176,6 +189,10 @@ impl ProtocolCommands for ValidatorProtocol {
                     format!("--authority {}", authority.index()),
                     format!("--public-config-path {}", public_config_path.display()),
                     format!("--private-config-path {}", private_config_path.display()),
+                    format!(
+                        "--validator-parameters-path {}",
+                        validator_parameters_path.display()
+                    ),
                 ];
                 if load > 0 {
                     run.push(format!(
@@ -290,5 +307,25 @@ impl ProtocolMetrics for ValidatorProtocol {
     {
         // The load generators live inside the nodes, which are scraped already.
         self.nodes_metrics_path(instances, parameters)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::remote::protocol::NodeParameters;
+
+    const CONSENSUS: &str = "consensus:\n  protocol: mysticeti\n  leader_count: 1\n";
+
+    #[test]
+    fn node_parameters_name_the_finality_protocol() {
+        let yaml = format!("{CONSENSUS}finality: a\n");
+        let parameters: NodeParameters = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(format!("{parameters:?}"), "mysticeti-l1-a");
+    }
+
+    #[test]
+    fn node_parameters_without_validator_fields_run_the_baseline() {
+        let parameters: NodeParameters = serde_yaml::from_str(CONSENSUS).unwrap();
+        assert_eq!(format!("{parameters:?}"), "mysticeti-l1-baseline");
     }
 }

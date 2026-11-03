@@ -8,12 +8,14 @@
 
 mod common;
 
+use checkpoint::checkpoint::Outcome;
 use common::Testbed;
 use execution::{
     fake::{FakeExecutor, FakeTransaction},
     object::{ObjectId, Version},
     store::StateView,
 };
+use validator::metrics::FINALIZE;
 
 #[tokio::test]
 async fn submitted_transactions_execute_identically_on_all_validators() {
@@ -32,14 +34,16 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
         )
         .await;
     testbed.wait_for_transactions(2).await;
-    testbed.wait_for_certified().await;
+    testbed.wait_for_decided().await;
     // Metric (b) observes every delivered sub-dag with real durations on the tokio path;
     // certification and end-to-end observe once per certified checkpoint.
     for validator in testbed.validators() {
         let histogram = validator.metrics().subdag_execution_latency_s();
         assert!(histogram.get_sample_count() > 0);
         assert!(histogram.get_sample_sum() > 0.0);
-        let certification = validator.metrics().checkpoint_certification_latency_s();
+        let certification = validator
+            .metrics()
+            .checkpoint_certification_latency_s(FINALIZE);
         assert!(certification.get_sample_count() > 0);
         assert!(certification.get_sample_sum() > 0.0);
         let end_to_end = validator.metrics().end_to_end_latency_s();
@@ -64,14 +68,14 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
     let (reference, certifier) = &results[0];
     let store = reference.store();
     let certified = certifier
-        .highest_certified()
+        .highest_decided()
         .expect("everything executed is certified");
-    assert_eq!(certified.checkpoint().commitment(), store.commitment());
+    assert_eq!(certified.outcome(), Outcome::Finalize(store.commitment()));
     // Certification is a deterministic function of the commit stream: every validator holds
     // the same byte-identical certificate and an empty pending window.
     for (scheduler, other) in &results {
         assert_eq!(scheduler.store(), store);
-        assert_eq!(other.highest_certified(), Some(certified));
+        assert_eq!(other.highest_decided(), Some(certified));
         assert!(other.pending().next().is_none());
     }
     let latest = store.latest(&id).expect("object must exist");

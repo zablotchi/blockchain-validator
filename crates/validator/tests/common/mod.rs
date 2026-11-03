@@ -106,13 +106,13 @@ impl Testbed {
         }
     }
 
-    /// Waits until everything executed is certified on every validator; call after an
+    /// Waits until everything executed is decided on every validator; call after an
     /// executed-count cut.
-    pub async fn wait_for_certified(&mut self) {
+    pub async fn wait_for_decided(&mut self) {
         for validator in &mut self.validators {
-            time::timeout(TIMEOUT, validator.wait_for_certified())
+            time::timeout(TIMEOUT, validator.wait_for_decided())
                 .await
-                .expect("timed out waiting for certification");
+                .expect("timed out waiting for decisions");
         }
     }
 

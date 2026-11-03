@@ -10,4 +10,5 @@ pub mod envelope;
 #[cfg(any(test, feature = "benchmark"))]
 pub mod generator;
 pub mod metrics;
+pub mod parameters;
 pub mod validator;

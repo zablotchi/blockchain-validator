@@ -476,7 +476,7 @@
                         "uid": "Fixed-UID-testbed"
                     },
                     "editorMode": "code",
-                    "expr": "histogram_quantile(0.5, sum by (le) (rate(checkpoint_certification_latency_s_bucket[1m]))) * 1000",
+                    "expr": "histogram_quantile(0.5, sum by (le) (rate(checkpoint_certification_latency_s_bucket{outcome=\"finalize\"}[1m]))) * 1000",
                     "hide": false,
                     "legendFormat": "Checkpoint certification",
                     "range": true,
@@ -584,7 +584,7 @@
                         "uid": "Fixed-UID-testbed"
                     },
                     "editorMode": "code",
-                    "expr": "histogram_quantile(0.5, sum by (le) (rate(checkpoint_certification_latency_s_bucket[1m]))) * 1000",
+                    "expr": "histogram_quantile(0.5, sum by (le) (rate(checkpoint_certification_latency_s_bucket{outcome=\"finalize\"}[1m]))) * 1000",
                     "hide": false,
                     "legendFormat": "Certification p50",
                     "range": true,
@@ -596,7 +596,7 @@
                         "uid": "Fixed-UID-testbed"
                     },
                     "editorMode": "code",
-                    "expr": "histogram_quantile(0.9, sum by (le) (rate(checkpoint_certification_latency_s_bucket[1m]))) * 1000",
+                    "expr": "histogram_quantile(0.9, sum by (le) (rate(checkpoint_certification_latency_s_bucket{outcome=\"finalize\"}[1m]))) * 1000",
                     "hide": false,
                     "legendFormat": "Certification p90",
                     "range": true,
@@ -608,7 +608,7 @@
                         "uid": "Fixed-UID-testbed"
                     },
                     "editorMode": "code",
-                    "expr": "histogram_quantile(0.99, sum by (le) (rate(checkpoint_certification_latency_s_bucket[1m]))) * 1000",
+                    "expr": "histogram_quantile(0.99, sum by (le) (rate(checkpoint_certification_latency_s_bucket{outcome=\"finalize\"}[1m]))) * 1000",
                     "hide": false,
                     "legendFormat": "Certification p99",
                     "range": true,

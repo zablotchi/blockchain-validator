@@ -6,6 +6,7 @@
 use checkpoint::{
     certifier::{CheckpointCertifier, CheckpointTimings},
     checkpoint::Checkpoint,
+    finality::FinalityProtocol,
 };
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use dag::{authority::Authority, block::BlockReference, committee::Committee};
@@ -22,7 +23,10 @@ fn mint(c: &mut Criterion) {
     group.throughput(Throughput::Elements(CHECKPOINTS));
     group.bench_function("mint", |b| {
         b.iter_batched(
-            || CheckpointCertifier::new(Committee::new_test(vec![1; COMMITTEE_SIZE]), QUORUM),
+            || {
+                let committee = Committee::new_test(vec![1; COMMITTEE_SIZE]);
+                CheckpointCertifier::new(committee, FinalityProtocol::Baseline, QUORUM)
+            },
             |mut certifier| {
                 for n in 1..=CHECKPOINTS {
                     let checkpoint = Checkpoint::new_for_test(n);
@@ -47,7 +51,15 @@ fn certify(c: &mut Criterion) {
     group.throughput(Throughput::Elements(CHECKPOINTS * QUORUM));
     group.bench_function("certify", |b| {
         b.iter_batched(
-            || CheckpointCertifier::new_for_test(vec![1; COMMITTEE_SIZE], QUORUM, CHECKPOINTS),
+            || {
+                let stake = vec![1; COMMITTEE_SIZE];
+                CheckpointCertifier::new_for_test(
+                    FinalityProtocol::Baseline,
+                    stake,
+                    QUORUM,
+                    CHECKPOINTS,
+                )
+            },
             |mut certifier| {
                 for n in 1..=CHECKPOINTS {
                     // The sub-dags delivering the votes commit after the checkpointed ones.
@@ -60,8 +72,8 @@ fn certify(c: &mut Criterion) {
                         );
                     }
                 }
-                let certified = certifier.highest_certified();
-                assert!(certified.is_some_and(|certified| certified.round() == CHECKPOINTS));
+                let decided = certifier.highest_decided();
+                assert!(decided.is_some_and(|decided| decided.round() == CHECKPOINTS));
                 certifier
             },
             BatchSize::SmallInput,
