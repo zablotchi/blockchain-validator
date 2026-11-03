@@ -5,9 +5,9 @@
 //! Unlike the smoke test, every validator submits through its own replica, so the total order
 //! of transactions is genuinely decided by consensus across concurrent proposers.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{num::NonZeroU64, path::Path, sync::Arc, time::Duration};
 
-use checkpoint::{certifier::CheckpointCertifier, checkpoint::Outcome};
+use checkpoint::{certifier::CheckpointCertifier, checkpoint::Outcome, finality::FinalityProtocol};
 use dag::{authority::Authority, context::Ctx, metrics::Metrics};
 use execution::{
     fake::{FakeExecutor, FakeTransaction},
@@ -25,8 +25,10 @@ use simulator::{
     LatencyModel, SimulatedNetwork, SimulatorContext, SimulatorExecutor, UniformLatency,
 };
 use validator::{
+    fork::ForkInjection,
     generator::LoadGeneratorConfig,
-    metrics::FINALIZE,
+    metrics::{FINALIZE, SKIP},
+    parameters::ValidatorParameters,
     validator::{ValidatorBuilder, ValidatorHandle},
 };
 
@@ -42,6 +44,8 @@ const SUBMISSION_INTERVAL: Duration = Duration::from_millis(100);
 /// A few generated transactions per consensus block, so the generator's block-splitting path
 /// (mid-batch flushes plus a partial trailing block) is exercised on every tick.
 const MAX_BLOCK_SIZE: usize = 512;
+/// Fork injection fragments every this many checkpoint heights.
+const FORK_PERIOD: u64 = 5;
 
 /// A committee of validators running under the simulator.
 struct SimulatedTestbed {
@@ -52,7 +56,7 @@ struct SimulatedTestbed {
 }
 
 impl SimulatedTestbed {
-    async fn start() -> Self {
+    async fn start(parameters: ValidatorParameters) -> Self {
         let mut public_config = PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE);
         public_config.parameters.dag.max_block_size = MAX_BLOCK_SIZE;
         let latency = LatencyModel::Uniform(UniformLatency { range_ms: 50..100 });
@@ -75,6 +79,7 @@ impl SimulatedTestbed {
             )
             .with_storage(StorageKind::Ephemeral)
             .with_simulated_crypto()
+            .with_parameters(parameters.clone())
             .with_metrics(node_metrics)
             .with_network(node_network)
             .build()
@@ -100,6 +105,20 @@ impl SimulatedTestbed {
     async fn wait_for_transactions(&mut self, count: u64) {
         for validator in &mut self.validators {
             validator.wait_for_transactions(count).await;
+        }
+    }
+
+    /// Drains to a fixed point: submissions have stopped, but transactions already queued keep
+    /// committing, and every validator must reach the same executed count and hold it for a
+    /// full quiescence window before the stores are comparable.
+    async fn drain(&mut self) {
+        loop {
+            let target = self.validators.iter().map(|v| v.executed()).max().unwrap();
+            self.wait_for_transactions(target).await;
+            SimulatorContext::sleep(DRAIN_INTERVAL).await;
+            if self.validators.iter().all(|v| v.executed() == target) {
+                break;
+            }
         }
     }
 
@@ -153,7 +172,7 @@ type RunOutcome = (
 
 fn run_once(seed: u64) -> RunOutcome {
     SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
-        let mut committee = SimulatedTestbed::start().await;
+        let mut committee = SimulatedTestbed::start(ValidatorParameters::default()).await;
         let generators: Vec<_> = committee
             .validators()
             .iter()
@@ -170,26 +189,7 @@ fn run_once(seed: u64) -> RunOutcome {
         for generator in &generators {
             SimulatorContext::abort(generator);
         }
-        // Drain to a fixed point: submissions have stopped, but transactions already queued
-        // keep committing, and every validator must reach the same executed count and hold it
-        // for a full quiescence window before the stores are comparable.
-        loop {
-            let target = committee
-                .validators()
-                .iter()
-                .map(|v| v.executed())
-                .max()
-                .unwrap();
-            committee.wait_for_transactions(target).await;
-            SimulatorContext::sleep(DRAIN_INTERVAL).await;
-            if committee
-                .validators()
-                .iter()
-                .all(|v| v.executed() == target)
-            {
-                break;
-            }
-        }
+        committee.drain().await;
         committee.wait_for_decided().await;
         // Metric (b) observes every delivered sub-dag. Values are zero under simulated time
         // (execution advances no simulated clock), so only population is meaningful.
@@ -291,4 +291,98 @@ fn simulation_is_deterministic_per_seed() {
             );
         }
     }
+}
+
+/// Every validator but the first forks into a group of its own at every [`FORK_PERIOD`]-th
+/// height: one commitment per validator, so none reaches f+1 support.
+fn fragmented(finality: FinalityProtocol) -> ValidatorParameters {
+    let groups = (1..COMMITTEE_SIZE)
+        .map(|index| vec![Authority::from(index)])
+        .collect();
+    let period = NonZeroU64::new(FORK_PERIOD).unwrap();
+    ValidatorParameters {
+        finality,
+        fork: Some(ForkInjection { groups, period }),
+    }
+}
+
+/// Runs the load generators until every validator executed [`TARGET_TRANSACTIONS`], then
+/// drains.
+async fn generate_load(parameters: ValidatorParameters) -> SimulatedTestbed {
+    let mut committee = SimulatedTestbed::start(parameters).await;
+    let generators: Vec<_> = committee
+        .validators()
+        .iter()
+        .map(|validator| validator.start_load_generator(LoadGeneratorConfig::new_for_test()))
+        .collect();
+    committee.wait_for_transactions(TARGET_TRANSACTIONS).await;
+    for generator in &generators {
+        SimulatorContext::abort(generator);
+    }
+    committee.drain().await;
+    committee
+}
+
+/// Each validator's count of finalized and skipped checkpoints.
+fn decisions(committee: &SimulatedTestbed) -> Vec<(u64, u64)> {
+    committee
+        .validators()
+        .iter()
+        .map(|validator| {
+            let count = |outcome| {
+                validator
+                    .metrics()
+                    .checkpoint_certification_latency_s(outcome)
+                    .get_sample_count()
+            };
+            (count(FINALIZE), count(SKIP))
+        })
+        .collect()
+}
+
+#[test]
+fn protocol_a_skips_fragmented_heights_and_finalizes_the_rest() {
+    SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
+        let mut committee = generate_load(fragmented(FinalityProtocol::A)).await;
+        committee.wait_for_decided().await;
+        let decisions = decisions(&committee);
+        // Skipped transactions are never finalized: only finalized heights close end-to-end.
+        for (validator, (finalized, _)) in committee.validators().iter().zip(&decisions) {
+            let end_to_end = validator.metrics().end_to_end_latency_s();
+            assert_eq!(end_to_end.get_sample_count(), *finalized);
+        }
+        let results = committee.shutdown().await;
+
+        let (_, reference) = &results[0];
+        for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
+            let minted = finalized + skipped;
+            assert!(
+                minted > FORK_PERIOD,
+                "the run must reach a fragmented height"
+            );
+            assert_eq!(skipped, minted / FORK_PERIOD);
+            assert_eq!(certifier.highest_decided(), reference.highest_decided());
+        }
+    });
+}
+
+#[test]
+fn baseline_stalls_at_the_first_fragmented_height() {
+    SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
+        let committee = generate_load(fragmented(FinalityProtocol::Baseline)).await;
+        let decisions = decisions(&committee);
+        let results = committee.shutdown().await;
+
+        for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
+            assert_eq!(skipped, 0);
+            // The watermark stops below the first fragmented height for good, and every height
+            // from there on stays pending, although the ones without a fork finalized.
+            let minted = certifier.pending().count() as u64 + FORK_PERIOD - 1;
+            assert!(
+                minted > FORK_PERIOD,
+                "the run must pass a fragmented height"
+            );
+            assert_eq!(finalized, minted - minted / FORK_PERIOD);
+        }
+    });
 }

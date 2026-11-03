@@ -43,7 +43,19 @@ impl Debug for NodeParameters {
             f,
             "{:?}-{}",
             self.replica.consensus, self.validator.finality
-        )
+        )?;
+        if let Some(fork) = &self.validator.fork {
+            let groups: Vec<_> = fork
+                .groups
+                .iter()
+                .map(|group| {
+                    let members: Vec<_> = group.iter().map(|a| a.index().to_string()).collect();
+                    members.join(".")
+                })
+                .collect();
+            write!(f, "-fork-{}-every-{}", groups.join("_"), fork.period)?;
+        }
+        Ok(())
     }
 }
 
@@ -317,10 +329,13 @@ mod tests {
     const CONSENSUS: &str = "consensus:\n  protocol: mysticeti\n  leader_count: 1\n";
 
     #[test]
-    fn node_parameters_name_the_finality_protocol() {
-        let yaml = format!("{CONSENSUS}finality: a\n");
+    fn node_parameters_name_the_finality_protocol_and_forks() {
+        let yaml = format!("{CONSENSUS}finality: a\nfork:\n  groups: [[1, 2], [3]]\n  period: 5\n");
         let parameters: NodeParameters = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(format!("{parameters:?}"), "mysticeti-l1-a");
+        assert_eq!(
+            format!("{parameters:?}"),
+            "mysticeti-l1-a-fork-1.2_3-every-5"
+        );
     }
 
     #[test]

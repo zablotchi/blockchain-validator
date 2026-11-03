@@ -12,6 +12,6 @@ repository:
 benchmark_duration: 120
 # The benchmark's total load (tx/s) is split evenly across the committee, truncating.
 # The node parameters file holds the replica's parameters (dag, consensus) and the validator's
-# (finality) side by side.
+# (finality, fork) side by side.
 # node_parameters_path: replica-parameters.yaml
 # client_parameters_path: load-generator-config.yaml

@@ -30,6 +30,7 @@ use tokio::sync::{mpsc, watch};
 use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
+    fork::ForkInjection,
     metrics::ValidatorMetrics,
     parameters::ValidatorParameters,
 };
@@ -119,7 +120,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             .consensus
             .to_protocol(&committee)?
             .quorum_threshold;
-        let finality = self.parameters.finality;
+        let ValidatorParameters { finality, fork } = self.parameters;
         // The certifier derives f+1 from the quorum, exactly for 2f+1 quorums only.
         eyre::ensure!(
             finality == FinalityProtocol::Baseline || quorum == 2 * committee.total_stake() / 3 + 1,
@@ -130,6 +131,8 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             state: ExecutionState {
                 scheduler: SequentialScheduler::new(self.engine),
                 certifier,
+                authority: self.authority,
+                fork,
                 minted: 0,
             },
             authority: self.authority,
@@ -158,6 +161,8 @@ pub struct Validator<E> {
 struct ExecutionState<E> {
     scheduler: SequentialScheduler<E>,
     certifier: CheckpointCertifier,
+    authority: Authority,
+    fork: Option<ForkInjection>,
     /// Checkpoints minted so far: the height of the latest one.
     minted: u64,
 }
@@ -329,9 +334,11 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 minted_at: now,
                 mean_timestamp_ms: stamp_sum_ms / executed as u64,
             };
-            self.certifier
-                .push(anchor, self.scheduler.store().commitment(), timings)
-                .clone()
+            let mut commitment = self.scheduler.store().commitment();
+            if let Some(fork) = &self.fork {
+                commitment = fork.commitment(self.authority, self.minted, commitment);
+            }
+            self.certifier.push(anchor, commitment, timings).clone()
         });
         // A vote can never reference its own delivering sub-dag's checkpoint (it is created
         // only after that sub-dag commits), so recording after minting loses nothing.
@@ -461,7 +468,7 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{num::NonZeroU64, path::Path, sync::Arc, time::Duration};
 
     use checkpoint::{
         certifier::CheckpointCertifier,
@@ -485,6 +492,7 @@ mod tests {
 
     use crate::{
         envelope::{Envelope, Payload},
+        fork::ForkInjection,
         metrics::{FINALIZE, ValidatorMetrics},
         parameters::ValidatorParameters,
         validator::{ExecutionState, ValidatorBuilder},
@@ -499,6 +507,8 @@ mod tests {
                 3,
                 0,
             ),
+            authority: Authority::new(0),
+            fork: None,
             minted: 0,
         }
     }
@@ -572,6 +582,29 @@ mod tests {
     }
 
     #[test]
+    fn forked_validators_mint_diverged_checkpoints_at_forked_heights_only() {
+        let mut state = state();
+        state.fork = Some(ForkInjection {
+            groups: vec![vec![Authority::new(0)]],
+            period: NonZeroU64::new(2).unwrap(),
+        });
+        let metrics = metrics();
+        let mut diverged = Vec::new();
+        for round in 1..=3 {
+            // Sub-dags executing nothing mint nothing, so they do not count as heights.
+            state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![vec![0xFF; 16]]));
+            let create = FakeTransaction::success(vec![], vec![ObjectId::new(round)], vec![]);
+            let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
+            let blocks = vec![(0, vec![execute])];
+            let (_, minted) =
+                state.execute_subdag(&metrics, Duration::ZERO, subdag_at(round, blocks));
+            let minted = minted.expect("executing sub-dag must mint a checkpoint");
+            diverged.push(minted.commitment() != state.scheduler.store().commitment());
+        }
+        assert_eq!(diverged, [false, true, false]);
+    }
+
+    #[test]
     fn protocol_a_rejects_consensus_quorums_other_than_2f_plus_1() {
         // Hybrid Mysticeti with no fault budget waits for all 4 validators, not 2f+1 = 3.
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -589,7 +622,10 @@ mod tests {
                 public_config.clone(),
                 private_config,
             )
-            .with_parameters(ValidatorParameters { finality })
+            .with_parameters(ValidatorParameters {
+                finality,
+                fork: None,
+            })
             .build()
         };
         assert!(build(FinalityProtocol::A).is_err());

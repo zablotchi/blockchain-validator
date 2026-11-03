@@ -70,8 +70,8 @@ pub struct RunArgs {
     /// generator.
     #[arg(long, value_name = "FILE")]
     pub load_generator_config_path: Option<String>,
-    /// Path to the validator parameters file (YAML: finality protocol). Uses defaults if
-    /// omitted.
+    /// Path to the validator parameters file (YAML: finality protocol, fork injection). Uses
+    /// defaults if omitted.
     #[arg(long, value_name = "FILE")]
     pub validator_parameters_path: Option<String>,
 }

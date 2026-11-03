@@ -3,6 +3,7 @@
 
 //! Cryptographic primitives for state commitments.
 
+use digest::Digest as _;
 use serde::{Deserialize, Serialize};
 
 /// The concrete hasher used for state commitments (Blake2b truncated to 256 bits).
@@ -20,6 +21,15 @@ impl Digest {
 
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// The hash of this digest and `salt`: deterministic, and distinct per salt. Fabricates
+    /// diverging commitments without touching the state they commit to.
+    pub fn salted(&self, salt: u64) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(self.0);
+        hasher.update(salt.to_be_bytes());
+        Self(hasher.finalize().into())
     }
 
     /// An arbitrary digest distinct per `byte`, for tests that need unequal commitments.
