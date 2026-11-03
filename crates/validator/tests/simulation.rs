@@ -21,7 +21,9 @@ use replica::{
     builder::StorageKind,
     config::{PrivateReplicaConfig, PublicReplicaConfig},
 };
-use simulator::{SimulatedNetwork, SimulatorContext, SimulatorExecutor};
+use simulator::{
+    LatencyModel, SimulatedNetwork, SimulatorContext, SimulatorExecutor, UniformLatency,
+};
 use validator::{
     generator::LoadGeneratorConfig,
     validator::{ValidatorBuilder, ValidatorHandle},
@@ -52,7 +54,7 @@ impl SimulatedTestbed {
     async fn start() -> Self {
         let mut public_config = PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE);
         public_config.parameters.dag.max_block_size = MAX_BLOCK_SIZE;
-        let latency = Duration::from_millis(50)..Duration::from_millis(100);
+        let latency = LatencyModel::Uniform(UniformLatency { range_ms: 50..100 });
         let (network, node_networks) = SimulatedNetwork::new(&public_config.committee(), latency);
         let private_configs =
             PrivateReplicaConfig::new_for_benchmarks(Path::new("unused"), COMMITTEE_SIZE);
@@ -71,7 +73,7 @@ impl SimulatedTestbed {
                 private_config,
             )
             .with_storage(StorageKind::Ephemeral)
-            .with_crypto_disabled()
+            .with_simulated_crypto()
             .with_metrics(node_metrics)
             .with_network(node_network)
             .build()
@@ -234,7 +236,7 @@ fn validators_converge_under_simulation() {
     for metrics in &metrics {
         let p50 = metrics
             .collect()
-            .latency_percentile_ms(0.5)
+            .transaction_latency_percentile_ms(0.5)
             .expect("commit-latency histogram must be populated");
         assert!(
             p50 > 0.0 && p50 < 2_000.0,

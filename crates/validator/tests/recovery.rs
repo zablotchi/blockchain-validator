@@ -104,10 +104,7 @@ async fn restarted_committee_recovers_execution_state() {
     }
 }
 
-// Todo: enable once asonnino/mysticeti#221 is fixed and the pinned rev is bumped — restarting
-// with unproposed payloads in the WAL currently panics the core thread (counter underflow).
 #[tokio::test]
-#[ignore = "blocked on asonnino/mysticeti#221: pending_transactions underflow on restart"]
 async fn restarted_committee_recertifies_lost_votes() {
     let dir = tempfile::tempdir().expect("temporary directory");
     let id = ObjectId::new(1);

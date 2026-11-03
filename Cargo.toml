@@ -42,6 +42,14 @@ orchestrator = { git = "https://github.com/asonnino/mysticeti", rev = "5a093a222
 replica = { git = "https://github.com/asonnino/mysticeti", rev = "5a093a2223bda5cca1d15ee6bee97438782ab32e" }
 simulator = { git = "https://github.com/asonnino/mysticeti", rev = "5a093a2223bda5cca1d15ee6bee97438782ab32e" }
 
+# Local override: build against the not yet pushed `feat/dag-block-stream` branch of a sibling
+# mysticeti checkout. Remove once that branch is pushed and the rev above is bumped.
+[patch."https://github.com/asonnino/mysticeti"]
+dag = { path = "../mysticeti/crates/dag" }
+orchestrator = { path = "../mysticeti/crates/orchestrator" }
+replica = { path = "../mysticeti/crates/replica" }
+simulator = { path = "../mysticeti/crates/simulator" }
+
 [profile.release]
 panic = "abort"
 debug = 1

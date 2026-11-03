@@ -95,8 +95,8 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
         self
     }
 
-    pub fn with_crypto_disabled(mut self) -> Self {
-        self.replica = self.replica.with_crypto_disabled();
+    pub fn with_simulated_crypto(mut self) -> Self {
+        self.replica = self.replica.with_simulated_crypto();
         self
     }
 
