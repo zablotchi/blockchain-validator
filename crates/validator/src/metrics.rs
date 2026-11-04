@@ -6,7 +6,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use checkpoint::checkpoint::Outcome;
+use checkpoint::{certifier::CheckpointTimings, checkpoint::Outcome};
 use prometheus::{
     Histogram, HistogramVec, IntCounter, Registry, register_histogram_vec_with_registry,
     register_histogram_with_registry, register_int_counter_with_registry,
@@ -81,21 +81,25 @@ impl ValidatorMetrics {
             .observe(latency.as_secs_f64());
     }
 
-    pub(crate) fn observe_checkpoint_certification_latency(
+    /// Closes the latency metrics of a checkpoint decided at `now`. Skipped transactions are
+    /// never finalized, so only finalized checkpoints close end to end.
+    pub(crate) fn observe_decision(
         &self,
+        now: Duration,
         outcome: Outcome,
-        latency: Duration,
+        timings: CheckpointTimings,
     ) {
         let label = match outcome {
             Outcome::Finalize(_) => FINALIZE,
             Outcome::Skip => SKIP,
         };
         self.checkpoint_certification_latency_s(label)
-            .observe(latency.as_secs_f64());
-    }
-
-    pub(crate) fn observe_end_to_end_latency(&self, latency: Duration) {
-        self.end_to_end_latency_s.observe(latency.as_secs_f64());
+            .observe(now.saturating_sub(timings.minted_at).as_secs_f64());
+        if let Outcome::Finalize(_) = outcome {
+            let submitted = Duration::from_millis(timings.mean_timestamp_ms);
+            self.end_to_end_latency_s
+                .observe(now.saturating_sub(submitted).as_secs_f64());
+        }
     }
 
     /// The raw metrics, for test assertions (`get`/`get_sample_count`/`get_sample_sum`).

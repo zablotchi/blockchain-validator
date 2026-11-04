@@ -18,7 +18,8 @@ Store memories for this project in the default location
   Builder/Aggregator/Executor pipeline, collapsed to a single self-certifying
   flow; tracks `highest_synced` / `highest_executed` watermarks.
 - `crates/validator` — glue: builds the replica, feeds transactions through
-  `TransactionClient`, wires the commit consumer into checkpoint + execution.
+  `TransactionClient`, wires the event consumer (blocks and commits) into checkpoint +
+  execution.
 
 Mysticeti crates (`dag`, `replica`, `simulator`) are git dependencies pinned to
 a rev in the workspace `Cargo.toml`; bump the rev everywhere at once.

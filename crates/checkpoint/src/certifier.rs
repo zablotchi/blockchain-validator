@@ -3,7 +3,11 @@
 
 //! Finality: tallying checkpoint votes into decided checkpoints.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use dag::{
     authority::{Authority, AuthoritySet},
@@ -116,6 +120,9 @@ pub struct CheckpointCertifier {
     pending: VecDeque<PendingCheckpoint>,
     /// The highest contiguously decided checkpoint; `None` until the first decision.
     watermark: Option<Decision>,
+    /// Votes counted on arrival for anchors not minted yet, each with its carrying block, in
+    /// arrival order.
+    early: BTreeMap<BlockReference, Vec<(Digest, BlockReference)>>,
 }
 
 impl CheckpointCertifier {
@@ -128,27 +135,51 @@ impl CheckpointCertifier {
             protocol,
             pending: VecDeque::new(),
             watermark: None,
+            early: BTreeMap::new(),
         }
     }
 
+    pub fn protocol(&self) -> FinalityProtocol {
+        self.protocol
+    }
+
     /// Mints this validator's checkpoint for the sub-dag anchored at `anchor` and returns it,
-    /// ready to submit as this validator's vote. The timings ride along and are surrendered
-    /// by [`record`](CheckpointCertifier::record) when the decision forms. Deciding can never
-    /// outrun minting: a vote only commits after the sub-dag it attests, which we process
-    /// first.
+    /// ready to submit as this validator's vote, with the outcome if votes counted before the
+    /// mint decide it. The timings ride along and are surrendered by
+    /// [`record`](CheckpointCertifier::record) when a later vote decides it. Only votes
+    /// counted on arrival can outrun minting: a vote commits after the sub-dag it attests,
+    /// which we process first.
     pub fn push(
         &mut self,
         anchor: BlockReference,
         commitment: Digest,
         timings: CheckpointTimings,
-    ) -> &Checkpoint {
+    ) -> (Checkpoint, Option<Outcome>) {
+        // Anchors are minted in commit order, so rounds never decrease: early votes for lower
+        // rounds attest anchors this validator never mints.
+        while let Some(entry) = self.early.first_entry()
+            && entry.key().round < anchor.round
+        {
+            entry.remove();
+        }
+        let local = Checkpoint::new(anchor, commitment);
         self.pending.push_back(PendingCheckpoint {
-            local: Checkpoint::new(anchor, commitment),
+            local: local.clone(),
             timings,
             tally: Tally::new(self.committee.len()),
             decision: None,
         });
-        &self.pending.back().expect("just pushed").local
+        let index = self.pending.len() - 1;
+        let outcome = self
+            .early
+            .remove(&anchor)
+            .into_iter()
+            .flatten()
+            .find_map(|(commitment, block)| self.count(index, commitment, block));
+        if outcome.is_some() {
+            self.advance_watermark();
+        }
+        (local, outcome)
     }
 
     /// This validator's checkpoints not yet contiguously decided, in commit order.
@@ -165,35 +196,68 @@ impl CheckpointCertifier {
         block: BlockReference,
         checkpoint: Checkpoint,
     ) -> Option<(Outcome, CheckpointTimings)> {
-        let author = block.authority;
         let voted_anchor = checkpoint.anchor();
-        // A vote cannot be witnessed before its anchor's sub-dag committed by construction.
-        // Window entries are in commit order, so anchor rounds are non-decreasing: binary
-        // search to the vote's round, then walk only the same-round (multi-leader) run.
-        let start = self
-            .pending
-            .partition_point(|entry| entry.round() < voted_anchor.round);
-        let entry = self
-            .pending
-            .range_mut(start..)
-            .take_while(|entry| entry.round() == voted_anchor.round)
-            .find(|entry| entry.local.anchor() == voted_anchor);
-        let Some(entry) = entry else {
+        let commitment = checkpoint.commitment();
+        let Some(index) = self.position(voted_anchor) else {
             let decided_round = self
                 .watermark
                 .as_ref()
                 .map_or(0, |decision| decision.round());
-            if voted_anchor.round > decided_round {
+            let minted_round = self
+                .pending
+                .back()
+                .map_or(decided_round, |entry| entry.round());
+            if self.protocol.counts_arrivals() && voted_anchor.round >= minted_round {
+                self.early
+                    .entry(voted_anchor)
+                    .or_default()
+                    .push((commitment, block));
+            } else if voted_anchor.round > decided_round {
+                let author = block.authority;
                 tracing::warn!(%author, ?voted_anchor, "checkpoint vote for an unknown anchor");
             }
             return None;
         };
+        let outcome = self.count(index, commitment, block)?;
+        let timings = self.pending[index].timings;
+        self.advance_watermark();
+        Some((outcome, timings))
+    }
+
+    /// The highest checkpoint such that it and all earlier checkpoints are decided.
+    pub fn highest_decided(&self) -> Option<&Decision> {
+        self.watermark.as_ref()
+    }
+
+    /// The window index of the checkpoint minted at `anchor`, if pending.
+    fn position(&self, anchor: BlockReference) -> Option<usize> {
+        // Window entries are in commit order, so anchor rounds are non-decreasing: binary
+        // search to the round, then walk only the same-round (multi-leader) run.
+        let start = self
+            .pending
+            .partition_point(|entry| entry.round() < anchor.round);
+        self.pending
+            .range(start..)
+            .take_while(|entry| entry.round() == anchor.round)
+            .position(|entry| entry.local.anchor() == anchor)
+            .map(|offset| start + offset)
+    }
+
+    /// Counts a vote for the pending checkpoint at `index` and returns the outcome exactly
+    /// when it decides the checkpoint.
+    fn count(
+        &mut self,
+        index: usize,
+        commitment: Digest,
+        block: BlockReference,
+    ) -> Option<Outcome> {
+        let entry = &mut self.pending[index];
         // Already decided, awaiting contiguity: an observed decision can never change.
         if entry.decision.is_some() {
             return None;
         }
-
-        let commitment = checkpoint.commitment();
+        let author = block.authority;
+        let voted_anchor = entry.local.anchor();
         let stake = self
             .committee
             .get_stake(author)
@@ -218,9 +282,11 @@ impl CheckpointCertifier {
         }
         let proof = std::mem::take(&mut entry.tally).proof(outcome);
         entry.decision = Some(Decision::new(voted_anchor, outcome, proof));
-        let timings = entry.timings;
+        Some(outcome)
+    }
 
-        // Advance the watermark over the contiguously decided prefix, reclaiming it.
+    /// Advances the watermark over the contiguously decided prefix, reclaiming it.
+    fn advance_watermark(&mut self) {
         while self
             .pending
             .front()
@@ -228,17 +294,10 @@ impl CheckpointCertifier {
         {
             self.watermark = self.pending.pop_front().and_then(|entry| entry.decision);
         }
-        Some((outcome, timings))
-    }
-
-    /// The highest checkpoint such that it and all earlier checkpoints are decided.
-    pub fn highest_decided(&self) -> Option<&Decision> {
-        self.watermark.as_ref()
     }
 
     /// A certifier over a [`Committee::new_test`] committee that already minted checkpoints
-    /// `1..=minted` matching [`Checkpoint::new_for_test`]: votes are only admissible for
-    /// locally witnessed checkpoints.
+    /// `1..=minted` matching [`Checkpoint::new_for_test`].
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(
         protocol: FinalityProtocol,
@@ -288,19 +347,6 @@ mod tests {
     /// The block of `author` carrying votes at the `n`-th round after the checkpointed ones.
     fn block(author: u64, n: u64) -> BlockReference {
         BlockReference::new_test(author, 100 + n)
-    }
-
-    #[test]
-    fn push_returns_the_minted_checkpoint() {
-        // A non-empty window distinguishes the newly minted entry from the front.
-        let mut certifier =
-            CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 1);
-        let minted = certifier.push(
-            vote(2).anchor(),
-            vote(2).commitment(),
-            CheckpointTimings::default(),
-        );
-        assert_eq!(minted, &vote(2));
     }
 
     #[test]
@@ -473,11 +519,100 @@ mod tests {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 1);
 
-        // Even a full quorum for a never-witnessed checkpoint allocates and certifies nothing.
+        // Even a full quorum for a never-witnessed checkpoint allocates and certifies nothing:
+        // counted at commit, a vote never precedes the mint it attests.
         for authority in 0..4 {
             certifier.record(block(authority, 0), vote(5));
         }
         assert_eq!(certifier.highest_decided(), None);
+        assert!(certifier.early.is_empty());
+    }
+
+    #[test]
+    fn arrivals_before_the_mint_count_from_it() {
+        let timings = CheckpointTimings {
+            minted_at: Duration::from_secs(1),
+            mean_timestamp_ms: 650,
+        };
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
+        certifier.record(block(0, 0), vote(1));
+        certifier.record(block(1, 0), vote(1));
+        assert_eq!(
+            certifier.push(vote(1).anchor(), vote(1).commitment(), timings),
+            (vote(1), None)
+        );
+
+        // The held votes count first, in arrival order.
+        let outcome = Outcome::Finalize(vote(1).commitment());
+        assert_eq!(
+            certifier.record(block(2, 1), vote(1)),
+            Some((outcome, timings))
+        );
+        let decided = certifier.highest_decided().expect("decided checkpoint");
+        assert_eq!(decided.proof(), [block(0, 0), block(1, 0), block(2, 1)]);
+    }
+
+    #[test]
+    fn arrivals_before_the_mint_can_decide_it() {
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
+        for authority in 0..3 {
+            assert_eq!(certifier.record(block(authority, 0), vote(1)), None);
+        }
+
+        let (_, outcome) = certifier.push(
+            vote(1).anchor(),
+            vote(1).commitment(),
+            CheckpointTimings::default(),
+        );
+        assert_eq!(outcome, Some(Outcome::Finalize(vote(1).commitment())));
+        let decided = certifier.highest_decided().expect("decided checkpoint");
+        assert_eq!(finalized(decided), vote(1));
+        assert!(certifier.pending().next().is_none());
+    }
+
+    #[test]
+    fn arrivals_for_a_later_same_round_anchor_are_held() {
+        // Multi-leader protocols mint several anchors per round: votes for the second can
+        // arrive after the first was minted.
+        let first = BlockReference::new_test(0, 7);
+        let second = BlockReference::new_test(1, 7);
+        let mut certifier = CheckpointCertifier::new(
+            Committee::new_test(vec![1; 4]),
+            FinalityProtocol::SuiBaseline,
+            3,
+        );
+        certifier.push(first, Digest::default(), CheckpointTimings::default());
+        let vote = Checkpoint::new(second, Digest::default());
+        for authority in 0..3 {
+            assert_eq!(certifier.record(block(authority, 0), vote.clone()), None);
+        }
+
+        let (_, outcome) = certifier.push(second, Digest::default(), CheckpointTimings::default());
+        assert_eq!(outcome, Some(Outcome::Finalize(Digest::default())));
+    }
+
+    #[test]
+    fn arrivals_for_anchors_never_minted_are_dropped_once_passed() {
+        let unminted = Checkpoint::new(BlockReference::new_test(2, 1), Digest::default());
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
+        certifier.record(block(0, 0), unminted);
+
+        // Another anchor of the same round may still mint after this one.
+        certifier.push(
+            vote(1).anchor(),
+            vote(1).commitment(),
+            CheckpointTimings::default(),
+        );
+        assert_eq!(certifier.early.len(), 1);
+        certifier.push(
+            vote(2).anchor(),
+            vote(2).commitment(),
+            CheckpointTimings::default(),
+        );
+        assert!(certifier.early.is_empty());
     }
 
     #[test]
@@ -492,8 +627,11 @@ mod tests {
         assert!(timings.is_some());
         assert_eq!(certifier.highest_decided(), None);
 
-        // A late vote for the certified-but-not-yet-contiguous checkpoint changes nothing.
-        certifier.record(block(3, 9), vote(2));
+        // Late votes for the certified-but-not-yet-contiguous checkpoint change nothing, even
+        // a full quorum of them (as when votes are counted on arrival and again at commit).
+        for authority in 0..4 {
+            certifier.record(block(authority, 9), vote(2));
+        }
 
         for authority in 0..3 {
             certifier.record(block(authority, 1), vote(1));

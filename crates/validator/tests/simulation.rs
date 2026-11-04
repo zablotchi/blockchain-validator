@@ -367,22 +367,71 @@ fn protocol_a_skips_fragmented_heights_and_finalizes_the_rest() {
 }
 
 #[test]
-fn baseline_stalls_at_the_first_fragmented_height() {
+fn baselines_stall_at_the_first_fragmented_height() {
+    for finality in [FinalityProtocol::Baseline, FinalityProtocol::SuiBaseline] {
+        SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
+            let committee = generate_load(fragmented(finality)).await;
+            let decisions = decisions(&committee);
+            let results = committee.shutdown().await;
+
+            for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
+                assert_eq!(skipped, 0, "{finality}");
+                // The watermark stops below the first fragmented height for good, and every
+                // height from there on stays pending, although the ones without a fork
+                // finalized.
+                let minted = certifier.pending().count() as u64 + FORK_PERIOD - 1;
+                assert!(
+                    minted > FORK_PERIOD,
+                    "the run must pass a fragmented height"
+                );
+                assert_eq!(finalized, minted - minted / FORK_PERIOD, "{finality}");
+            }
+        });
+    }
+}
+
+/// Each validator's mean checkpoint certification latency, in seconds, over a fork-free run.
+fn certification_latencies(finality: FinalityProtocol) -> Vec<f64> {
     SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
-        let committee = generate_load(fragmented(FinalityProtocol::Baseline)).await;
-        let decisions = decisions(&committee);
+        let parameters = ValidatorParameters {
+            finality,
+            fork: None,
+        };
+        let mut committee = generate_load(parameters).await;
+        committee.wait_for_decided().await;
+        let latencies = committee
+            .validators()
+            .iter()
+            .map(|validator| {
+                let histogram = validator
+                    .metrics()
+                    .checkpoint_certification_latency_s(FINALIZE);
+                histogram.get_sample_sum() / histogram.get_sample_count() as f64
+            })
+            .collect();
         let results = committee.shutdown().await;
 
-        for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
-            assert_eq!(skipped, 0);
-            // The watermark stops below the first fragmented height for good, and every height
-            // from there on stays pending, although the ones without a fork finalized.
-            let minted = certifier.pending().count() as u64 + FORK_PERIOD - 1;
-            assert!(
-                minted > FORK_PERIOD,
-                "the run must pass a fragmented height"
-            );
-            assert_eq!(finalized, minted - minted / FORK_PERIOD);
+        // Validators see votes arrive in different orders, so proofs may differ, outcomes not.
+        let (_, reference) = &results[0];
+        let decided = |certifier: &CheckpointCertifier| {
+            let decision = certifier.highest_decided().expect("decided checkpoint");
+            (decision.anchor(), decision.outcome())
+        };
+        for (_, certifier) in &results {
+            assert_eq!(decided(certifier), decided(reference), "{finality}");
         }
-    });
+        latencies
+    })
+}
+
+#[test]
+fn the_sui_baseline_decides_on_arrival_ahead_of_the_baseline() {
+    let baseline = certification_latencies(FinalityProtocol::Baseline);
+    let sui = certification_latencies(FinalityProtocol::SuiBaseline);
+    for (sui, baseline) in sui.iter().zip(&baseline) {
+        assert!(
+            sui < baseline,
+            "the Sui-style baseline took {sui} s, the baseline {baseline} s"
+        );
+    }
 }

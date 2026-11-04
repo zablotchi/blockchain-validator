@@ -3,6 +3,8 @@
 
 //! The consensus payload envelope and its byte codec.
 
+use std::ops::Range;
+
 use bincode::Options;
 use checkpoint::checkpoint::Checkpoint;
 use execution::transaction::Transaction;
@@ -11,6 +13,11 @@ use serde::{Deserialize, Serialize};
 /// Payloads larger than this fail to decode. Bounds the allocations a malformed length prefix
 /// can request, since payload bytes come from untrusted clients via consensus.
 pub const MAX_PAYLOAD_SIZE: u64 = 1024 * 1024;
+
+/// Where fixint bincode puts the payload's variant index, after the timestamp, and its value
+/// for [`Payload::Attest`].
+const TAG: Range<usize> = 8..12;
+const ATTEST_TAG: [u8; 4] = 1u32.to_le_bytes();
 
 /// What every consensus payload carries: the submission timestamp, then the payload proper.
 ///
@@ -66,6 +73,18 @@ impl Envelope {
             .with_limit(MAX_PAYLOAD_SIZE)
             .deserialize_from(bytes)
     }
+
+    /// Decodes the checkpoint vote in consensus payload bytes, if they carry one. Other
+    /// payloads are told apart by their variant tag, without decoding them.
+    pub(crate) fn attestation_from_bytes(bytes: &[u8]) -> Option<Checkpoint> {
+        if bytes.get(TAG) != Some(&ATTEST_TAG[..]) {
+            return None;
+        }
+        match Self::from_bytes(bytes).ok()?.into_payload() {
+            Payload::Attest(checkpoint) => Some(checkpoint),
+            Payload::Execute(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +114,19 @@ mod tests {
         let envelope = Envelope::new(1234, Payload::Attest(Checkpoint::new_for_test(1)));
         let decoded = Envelope::from_bytes(&envelope.to_bytes()).unwrap();
         assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn attestations_are_told_apart_from_transactions() {
+        let checkpoint = Checkpoint::new_for_test(1);
+        let attestation = Envelope::new(1234, Payload::Attest(checkpoint.clone())).to_bytes();
+        assert_eq!(
+            Envelope::attestation_from_bytes(&attestation),
+            Some(checkpoint)
+        );
+        let transaction = envelope(1234, vec![1, 2, 3]).to_bytes();
+        assert_eq!(Envelope::attestation_from_bytes(&transaction), None);
+        assert_eq!(Envelope::attestation_from_bytes(&attestation[..12]), None);
     }
 
     #[test]
