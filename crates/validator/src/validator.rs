@@ -296,8 +296,6 @@ impl<E: ExecutionEngine> ExecutionState<E> {
     ) -> (usize, Option<Checkpoint>) {
         let anchor = subdag.anchor;
         subdag.sort();
-        // Votes are attributed to the block author: they ride their author's own signed
-        // blocks, so no authority can forge another's vote.
         let mut votes = Vec::new();
         // Submission stamps reduce to their sum here, while the payloads are in hand.
         let mut stamp_sum_ms = 0u64;
@@ -305,13 +303,13 @@ impl<E: ExecutionEngine> ExecutionState<E> {
             .blocks
             .iter()
             .flat_map(|block| {
-                let author = block.author();
+                let reference = *block.reference();
                 block
                     .transactions()
                     .iter()
-                    .map(move |payload| (author, payload))
+                    .map(move |payload| (reference, payload))
             })
-            .filter_map(|(author, payload)| {
+            .filter_map(|(block, payload)| {
                 let envelope = Envelope::from_bytes(payload.as_bytes())
                     .inspect_err(|error| tracing::warn!(?error, "skipping undecodable payload"))
                     .ok()?;
@@ -322,7 +320,7 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                         Some(transaction)
                     }
                     Payload::Attest(vote) => {
-                        votes.push((author, vote));
+                        votes.push((block, vote));
                         None
                     }
                 }
@@ -342,8 +340,8 @@ impl<E: ExecutionEngine> ExecutionState<E> {
         });
         // A vote can never reference its own delivering sub-dag's checkpoint (it is created
         // only after that sub-dag commits), so recording after minting loses nothing.
-        for (author, vote) in votes {
-            if let Some((outcome, timings)) = self.certifier.record(anchor, author, vote) {
+        for (block, vote) in votes {
+            if let Some((outcome, timings)) = self.certifier.record(block, vote) {
                 metrics.observe_checkpoint_certification_latency(
                     outcome,
                     now.saturating_sub(timings.minted_at),
@@ -657,7 +655,11 @@ mod tests {
             })
             .collect();
         let delivering = subdag_at(2, votes);
-        let anchor = delivering.anchor;
+        let carrying: Vec<_> = delivering
+            .blocks
+            .iter()
+            .map(|block| *block.reference())
+            .collect();
         let (executed, minted) = state.execute_subdag(&metrics, Duration::from_secs(4), delivering);
 
         assert_eq!(executed, 0);
@@ -667,8 +669,8 @@ mod tests {
             .highest_decided()
             .expect("quorum must certify");
         assert!(finalizes(certified, &checkpoint));
-        // The proof records the delivering sub-dag's anchor per counted vote.
-        assert_eq!(certified.proof(), [anchor; 3]);
+        // The proof records the block carrying each counted vote.
+        assert_eq!(certified.proof(), carrying);
         assert!(state.certifier.pending().next().is_none());
         // Certification closed the latency metrics: minted at 1s and certified at 4s, with a
         // mean submission stamp of 2s.

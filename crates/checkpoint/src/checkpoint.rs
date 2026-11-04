@@ -53,7 +53,7 @@ pub enum Outcome {
     Skip,
 }
 
-/// A decided checkpoint height: its outcome and the delivering sub-dag of each vote backing it.
+/// A decided checkpoint height: its outcome and the block carrying each vote backing it.
 #[derive(PartialEq, Debug)]
 pub struct Decision {
     anchor: BlockReference,

@@ -25,8 +25,8 @@ struct Tally {
     voted: Stake,
     /// The stake attesting each commitment, in order of first appearance.
     support: Vec<(Digest, Stake)>,
-    /// Each counted vote's author, commitment, and delivering sub-dag.
-    votes: Vec<(Authority, Digest, BlockReference)>,
+    /// Each counted vote's commitment and carrying block.
+    votes: Vec<(Digest, BlockReference)>,
 }
 
 impl Tally {
@@ -39,20 +39,14 @@ impl Tally {
         }
     }
 
-    /// Counts `author`'s vote and returns its commitment's support, or `None` if `author`
-    /// already voted.
-    fn add(
-        &mut self,
-        author: Authority,
-        stake: Stake,
-        commitment: Digest,
-        subdag: BlockReference,
-    ) -> Option<Stake> {
-        if !self.voters.insert(author) {
+    /// Counts the vote `block` carries and returns its commitment's support, or `None` if the
+    /// block's author already voted.
+    fn add(&mut self, stake: Stake, commitment: Digest, block: BlockReference) -> Option<Stake> {
+        if !self.voters.insert(block.authority) {
             return None;
         }
         self.voted += stake;
-        self.votes.push((author, commitment, subdag));
+        self.votes.push((commitment, block));
         match self
             .support
             .iter_mut()
@@ -73,19 +67,19 @@ impl Tally {
     fn attested(&self, author: Authority) -> Option<Digest> {
         self.votes
             .iter()
-            .find(|(voter, ..)| *voter == author)
-            .map(|(_, attested, _)| *attested)
+            .find(|(_, block)| block.authority == author)
+            .map(|(attested, _)| *attested)
     }
 
-    /// The delivering sub-dags of the votes backing `outcome`, in count order.
+    /// The blocks carrying the votes backing `outcome`, in count order.
     fn proof(&self, outcome: Outcome) -> Vec<BlockReference> {
         self.votes
             .iter()
-            .filter(|(_, attested, _)| match outcome {
+            .filter(|(attested, _)| match outcome {
                 Outcome::Finalize(finalized) => *attested == finalized,
                 Outcome::Skip => true,
             })
-            .map(|(.., subdag)| *subdag)
+            .map(|(_, block)| *block)
             .collect()
     }
 }
@@ -162,15 +156,16 @@ impl CheckpointCertifier {
         self.pending.iter().map(|entry| &entry.local)
     }
 
-    /// Counts `author`'s vote for `checkpoint`, delivered in the committed sub-dag anchored at
-    /// `subdag`. The first vote per authority and checkpoint wins. Returns the outcome and the
-    /// mint timings exactly when this vote decides the checkpoint.
+    /// Counts the vote for `checkpoint` carried by `block`, attributed to the block's author:
+    /// votes ride their author's own signed blocks, so no authority can forge another's. The
+    /// first vote per authority and checkpoint wins. Returns the outcome and the mint timings
+    /// exactly when this vote decides the checkpoint.
     pub fn record(
         &mut self,
-        subdag: BlockReference,
-        author: Authority,
+        block: BlockReference,
         checkpoint: Checkpoint,
     ) -> Option<(Outcome, CheckpointTimings)> {
+        let author = block.authority;
         let voted_anchor = checkpoint.anchor();
         // A vote cannot be witnessed before its anchor's sub-dag committed by construction.
         // Window entries are in commit order, so anchor rounds are non-decreasing: binary
@@ -203,7 +198,7 @@ impl CheckpointCertifier {
             .committee
             .get_stake(author)
             .expect("Authority not found");
-        let Some(support) = entry.tally.add(author, stake, commitment, subdag) else {
+        let Some(support) = entry.tally.add(stake, commitment, block) else {
             if entry.tally.attested(author) != Some(commitment) {
                 tracing::warn!(%author, ?voted_anchor, "conflicting checkpoint vote");
             }
@@ -268,7 +263,7 @@ impl CheckpointCertifier {
 mod tests {
     use std::time::Duration;
 
-    use dag::{authority::Authority, block::BlockReference, committee::Committee};
+    use dag::{block::BlockReference, committee::Committee};
     use execution::crypto::Digest;
 
     use crate::{
@@ -290,9 +285,9 @@ mod tests {
         }
     }
 
-    /// The anchor of the `n`-th sub-dag delivering votes, after the checkpointed ones.
-    fn subdag(n: u64) -> BlockReference {
-        BlockReference::new_test(0, 100 + n)
+    /// The block of `author` carrying votes at the `n`-th round after the checkpointed ones.
+    fn block(author: u64, n: u64) -> BlockReference {
+        BlockReference::new_test(author, 100 + n)
     }
 
     #[test]
@@ -318,23 +313,14 @@ mod tests {
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 0);
         certifier.push(vote(1).anchor(), vote(1).commitment(), timings);
 
+        assert_eq!(certifier.record(block(0, 0), vote(1)), None);
+        assert_eq!(certifier.record(block(1, 0), vote(1)), None);
         assert_eq!(
-            certifier.record(subdag(0), Authority::new(0), vote(1)),
-            None
-        );
-        assert_eq!(
-            certifier.record(subdag(0), Authority::new(1), vote(1)),
-            None
-        );
-        assert_eq!(
-            certifier.record(subdag(1), Authority::new(2), vote(1)),
+            certifier.record(block(2, 1), vote(1)),
             Some((Outcome::Finalize(vote(1).commitment()), timings))
         );
         // The certificate never changes, and the timings surrender exactly once.
-        assert_eq!(
-            certifier.record(subdag(2), Authority::new(3), vote(1)),
-            None
-        );
+        assert_eq!(certifier.record(block(3, 2), vote(1)), None);
     }
 
     #[test]
@@ -342,39 +328,39 @@ mod tests {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 2);
         for authority in 0..3 {
-            certifier.record(subdag(0), Authority::new(authority), vote(1));
+            certifier.record(block(authority, 0), vote(1));
         }
         assert_eq!(certifier.pending().collect::<Vec<_>>(), [&vote(2)]);
     }
 
     #[test]
-    fn quorum_certifies_at_threshold_with_the_delivering_subdags_as_proof() {
+    fn quorum_certifies_at_threshold_with_the_carrying_blocks_as_proof() {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 1);
-        certifier.record(subdag(0), Authority::new(0), vote(1));
-        certifier.record(subdag(0), Authority::new(1), vote(1));
+        certifier.record(block(0, 0), vote(1));
+        certifier.record(block(1, 0), vote(1));
         assert_eq!(certifier.highest_decided(), None);
 
-        certifier.record(subdag(1), Authority::new(2), vote(1));
+        certifier.record(block(2, 1), vote(1));
         let certified = certifier.highest_decided().expect("certified checkpoint");
         assert_eq!(finalized(certified), vote(1));
-        assert_eq!(certified.proof(), [subdag(0), subdag(0), subdag(1)]);
+        assert_eq!(certified.proof(), [block(0, 0), block(1, 0), block(2, 1)]);
 
         // A late matching vote does not grow the proof.
-        certifier.record(subdag(2), Authority::new(3), vote(1));
+        certifier.record(block(3, 2), vote(1));
         let certified = certifier.highest_decided().expect("certified checkpoint");
-        assert_eq!(certified.proof(), [subdag(0), subdag(0), subdag(1)]);
+        assert_eq!(certified.proof(), [block(0, 0), block(1, 0), block(2, 1)]);
     }
 
     #[test]
     fn duplicate_votes_add_no_stake() {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 2, 1);
-        certifier.record(subdag(0), Authority::new(0), vote(1));
-        certifier.record(subdag(1), Authority::new(0), vote(1));
+        certifier.record(block(0, 0), vote(1));
+        certifier.record(block(0, 1), vote(1));
         assert_eq!(certifier.highest_decided(), None);
 
-        certifier.record(subdag(2), Authority::new(1), vote(1));
+        certifier.record(block(1, 2), vote(1));
         assert!(certifier.highest_decided().is_some());
     }
 
@@ -382,10 +368,10 @@ mod tests {
     fn a_single_vote_crossing_quorum_certifies() {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![5, 1, 1, 1], 5, 1);
-        certifier.record(subdag(0), Authority::new(0), vote(1));
+        certifier.record(block(0, 0), vote(1));
 
         let certified = certifier.highest_decided().expect("certified checkpoint");
-        assert_eq!(certified.proof(), [subdag(0)]);
+        assert_eq!(certified.proof(), [block(0, 0)]);
     }
 
     #[test]
@@ -394,15 +380,15 @@ mod tests {
 
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 1);
-        certifier.record(subdag(9), Authority::new(0), diverged());
-        certifier.record(subdag(0), Authority::new(1), vote(1));
-        certifier.record(subdag(0), Authority::new(2), vote(1));
-        certifier.record(subdag(1), Authority::new(3), vote(1));
+        certifier.record(block(0, 9), diverged());
+        certifier.record(block(1, 0), vote(1));
+        certifier.record(block(2, 0), vote(1));
+        certifier.record(block(3, 1), vote(1));
 
-        // The majority value certifies, and the diverged vote's sub-dag stays out of the proof.
+        // The majority value certifies, and the diverged vote's block stays out of the proof.
         let certified = certifier.highest_decided().expect("certified checkpoint");
         assert_eq!(finalized(certified), vote(1));
-        assert_eq!(certified.proof(), [subdag(0), subdag(0), subdag(1)]);
+        assert_eq!(certified.proof(), [block(1, 0), block(2, 0), block(3, 1)]);
     }
 
     #[test]
@@ -411,14 +397,14 @@ mod tests {
 
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 1);
-        certifier.record(subdag(0), Authority::new(0), vote(1));
-        certifier.record(subdag(0), Authority::new(1), vote(1));
-        certifier.record(subdag(0), Authority::new(2), diverged());
-        certifier.record(subdag(0), Authority::new(3), diverged());
+        certifier.record(block(0, 0), vote(1));
+        certifier.record(block(1, 0), vote(1));
+        certifier.record(block(2, 0), diverged());
+        certifier.record(block(3, 0), diverged());
         assert_eq!(certifier.highest_decided(), None);
 
         // A conflicting second vote is ignored: the first wins.
-        certifier.record(subdag(1), Authority::new(0), diverged());
+        certifier.record(block(0, 1), diverged());
         assert_eq!(certifier.highest_decided(), None);
     }
 
@@ -429,7 +415,7 @@ mod tests {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 1);
         for authority in 0..3 {
-            certifier.record(subdag(0), Authority::new(authority), diverged());
+            certifier.record(block(authority, 0), diverged());
         }
 
         // The certificate carries the quorum's commitment, not ours, and the entry is
@@ -465,17 +451,17 @@ mod tests {
 
         // A same-round anchor that was never minted certifies nothing.
         for authority in 0..4 {
-            certifier.record(subdag(9), Authority::new(authority), unminted());
+            certifier.record(block(authority, 9), unminted());
         }
         assert_eq!(certifier.highest_decided(), None);
 
         // Both same-round checkpoints certify, even voted out of mint order.
         for authority in 0..3 {
-            certifier.record(subdag(0), Authority::new(authority), second());
+            certifier.record(block(authority, 0), second());
         }
         assert_eq!(certifier.highest_decided(), None);
         for authority in 0..3 {
-            certifier.record(subdag(1), Authority::new(authority), first());
+            certifier.record(block(authority, 1), first());
         }
         let certified = certifier.highest_decided().expect("certified checkpoint");
         assert_eq!(finalized(certified), second());
@@ -489,7 +475,7 @@ mod tests {
 
         // Even a full quorum for a never-witnessed checkpoint allocates and certifies nothing.
         for authority in 0..4 {
-            certifier.record(subdag(0), Authority::new(authority), vote(5));
+            certifier.record(block(authority, 0), vote(5));
         }
         assert_eq!(certifier.highest_decided(), None);
     }
@@ -500,25 +486,25 @@ mod tests {
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 3);
         let mut timings = None;
         for authority in 0..3 {
-            timings = certifier.record(subdag(0), Authority::new(authority), vote(2));
+            timings = certifier.record(block(authority, 0), vote(2));
         }
         // The certificate formed — timings surrendered — although not yet contiguous.
         assert!(timings.is_some());
         assert_eq!(certifier.highest_decided(), None);
 
         // A late vote for the certified-but-not-yet-contiguous checkpoint changes nothing.
-        certifier.record(subdag(9), Authority::new(3), vote(2));
+        certifier.record(block(3, 9), vote(2));
 
         for authority in 0..3 {
-            certifier.record(subdag(1), Authority::new(authority), vote(1));
+            certifier.record(block(authority, 1), vote(1));
         }
         let certified = certifier.highest_decided().expect("certified checkpoint");
         assert_eq!(finalized(certified), vote(2));
-        assert_eq!(certified.proof(), [subdag(0), subdag(0), subdag(0)]);
+        assert_eq!(certified.proof(), [block(0, 0), block(1, 0), block(2, 0)]);
 
         // The watermark keeps advancing from where it stands.
         for authority in 0..3 {
-            certifier.record(subdag(2), Authority::new(authority), vote(3));
+            certifier.record(block(authority, 2), vote(3));
         }
         let certified = certifier.highest_decided().expect("certified checkpoint");
         assert_eq!(finalized(certified), vote(3));
@@ -529,28 +515,28 @@ mod tests {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 1);
         for authority in 0..3 {
-            certifier.record(subdag(0), Authority::new(authority), vote(1));
+            certifier.record(block(authority, 0), vote(1));
         }
 
         // A full quorum re-voting a reclaimed checkpoint cannot alter the certificate.
         for authority in 0..4 {
-            certifier.record(subdag(5), Authority::new(authority), vote(1));
+            certifier.record(block(authority, 5), vote(1));
         }
         let certified = certifier.highest_decided().expect("certified checkpoint");
-        assert_eq!(certified.proof(), [subdag(0), subdag(0), subdag(0)]);
+        assert_eq!(certified.proof(), [block(0, 0), block(1, 0), block(2, 0)]);
     }
 
     #[test]
     fn votes_are_stake_weighted() {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![5, 1, 1, 1], 5, 1);
-        certifier.record(subdag(0), Authority::new(1), vote(1));
-        certifier.record(subdag(0), Authority::new(2), vote(1));
-        certifier.record(subdag(0), Authority::new(3), vote(1));
+        certifier.record(block(1, 0), vote(1));
+        certifier.record(block(2, 0), vote(1));
+        certifier.record(block(3, 0), vote(1));
         assert_eq!(certifier.highest_decided(), None);
 
         // The heavy validator tips 3 stake over the threshold.
-        certifier.record(subdag(1), Authority::new(0), vote(1));
+        certifier.record(block(0, 1), vote(1));
         let certified = certifier.highest_decided().expect("certified checkpoint");
         assert_eq!(certified.proof().len(), 4);
     }
@@ -561,24 +547,18 @@ mod tests {
 
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::A, vec![1; 4], 3, 1);
-        assert_eq!(
-            certifier.record(subdag(0), Authority::new(0), diverged()),
-            None
-        );
-        assert_eq!(
-            certifier.record(subdag(1), Authority::new(1), vote(1)),
-            None
-        );
+        assert_eq!(certifier.record(block(0, 0), diverged()), None);
+        assert_eq!(certifier.record(block(1, 1), vote(1)), None);
 
         // The third voter completes a quorum, but its vote is also the second matching one.
         let outcome = Outcome::Finalize(vote(1).commitment());
         assert_eq!(
-            certifier.record(subdag(2), Authority::new(2), vote(1)),
+            certifier.record(block(2, 2), vote(1)),
             Some((outcome, CheckpointTimings::default()))
         );
         let decided = certifier.highest_decided().expect("decided checkpoint");
         assert_eq!(finalized(decided), vote(1));
-        assert_eq!(decided.proof(), [subdag(1), subdag(2)]);
+        assert_eq!(decided.proof(), [block(1, 1), block(2, 2)]);
     }
 
     #[test]
@@ -587,25 +567,22 @@ mod tests {
 
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::A, vec![1; 4], 3, 1);
-        certifier.record(subdag(0), Authority::new(0), vote(1));
+        certifier.record(block(0, 0), vote(1));
         // Repeat votes, matching or not, add no voted stake: two voters are not a quorum.
-        certifier.record(subdag(1), Authority::new(0), vote(1));
-        certifier.record(subdag(1), Authority::new(0), diverged(3));
+        certifier.record(block(0, 1), vote(1));
+        certifier.record(block(0, 1), diverged(3));
+        assert_eq!(certifier.record(block(1, 1), diverged(1)), None);
         assert_eq!(
-            certifier.record(subdag(1), Authority::new(1), diverged(1)),
-            None
-        );
-        assert_eq!(
-            certifier.record(subdag(2), Authority::new(2), diverged(2)),
+            certifier.record(block(2, 2), diverged(2)),
             Some((Outcome::Skip, CheckpointTimings::default()))
         );
         let decided = certifier.highest_decided().expect("decided checkpoint");
         assert_eq!(decided.anchor(), vote(1).anchor());
         assert_eq!(decided.outcome(), Outcome::Skip);
-        assert_eq!(decided.proof(), [subdag(0), subdag(1), subdag(2)]);
+        assert_eq!(decided.proof(), [block(0, 0), block(1, 1), block(2, 2)]);
 
         // A late vote that would make f+1 matching cannot overturn the skip.
-        certifier.record(subdag(3), Authority::new(3), vote(1));
+        certifier.record(block(3, 3), vote(1));
         let decided = certifier.highest_decided().expect("decided checkpoint");
         assert_eq!(decided.outcome(), Outcome::Skip);
     }
@@ -617,17 +594,13 @@ mod tests {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::A, vec![1; 4], 3, 2);
         for authority in 0..2 {
-            certifier.record(subdag(0), Authority::new(authority), vote(2));
+            certifier.record(block(authority, 0), vote(2));
         }
         assert_eq!(certifier.highest_decided(), None);
 
         // Skipping the first checkpoint makes the finalized second one contiguous.
         for authority in 0..3 {
-            certifier.record(
-                subdag(1),
-                Authority::new(authority),
-                diverged(authority as u8),
-            );
+            certifier.record(block(authority, 1), diverged(authority as u8));
         }
         let decided = certifier.highest_decided().expect("decided checkpoint");
         assert_eq!(finalized(decided), vote(2));

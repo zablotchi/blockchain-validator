@@ -9,7 +9,7 @@ use checkpoint::{
     finality::FinalityProtocol,
 };
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use dag::{authority::Authority, block::BlockReference, committee::Committee};
+use dag::{block::BlockReference, committee::Committee};
 
 /// The pending window each benchmark works through.
 const CHECKPOINTS: u64 = 100;
@@ -62,14 +62,10 @@ fn certify(c: &mut Criterion) {
             },
             |mut certifier| {
                 for n in 1..=CHECKPOINTS {
-                    // The sub-dags delivering the votes commit after the checkpointed ones.
-                    let subdag = BlockReference::new_test(0, CHECKPOINTS + n);
+                    // The blocks carrying the votes commit after the checkpointed sub-dags.
                     for authority in 0..QUORUM {
-                        certifier.record(
-                            subdag,
-                            Authority::new(authority),
-                            Checkpoint::new_for_test(n),
-                        );
+                        let block = BlockReference::new_test(authority, CHECKPOINTS + n);
+                        certifier.record(block, Checkpoint::new_for_test(n));
                     }
                 }
                 let decided = certifier.highest_decided();
