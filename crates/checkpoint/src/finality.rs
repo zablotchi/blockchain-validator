@@ -26,12 +26,17 @@ pub enum FinalityProtocol {
     /// Finalize at f+1 matching votes, the first commitment to reach them winning; skip once
     /// 2f+1 voted without one doing so.
     A,
+    /// A's rule over votes counted as their blocks arrive, concluding in a certificate each
+    /// validator submits through consensus; the first valid certificate to commit decides.
+    B,
 }
 
 impl FinalityProtocol {
-    /// Decides a height once a counted vote lifts its `commitment`'s support to `support` and
-    /// the height's voted stake to `voted`; `None` while undecided.
-    pub(crate) fn decide(
+    /// Concludes a height's tally once a counted vote lifts its `commitment`'s support to
+    /// `support` and the height's voted stake to `voted`; `None` while open. The conclusion is
+    /// the decision, or what the certificate claims if the protocol
+    /// [certifies](FinalityProtocol::certifies).
+    pub(crate) fn conclude(
         self,
         thresholds: Thresholds,
         commitment: Digest,
@@ -42,19 +47,51 @@ impl FinalityProtocol {
             Self::Baseline | Self::SuiBaseline => {
                 (support >= thresholds.quorum).then_some(Outcome::Finalize(commitment))
             }
-            Self::A if support >= thresholds.validity => Some(Outcome::Finalize(commitment)),
-            Self::A => (voted >= thresholds.quorum).then_some(Outcome::Skip),
+            Self::A | Self::B if support >= thresholds.validity => {
+                Some(Outcome::Finalize(commitment))
+            }
+            Self::A | Self::B => (voted >= thresholds.quorum).then_some(Outcome::Skip),
+        }
+    }
+
+    /// Whether a certificate's cited votes, totalling `voted` stake with `support` per
+    /// commitment, justify the `outcome` it claims: they alone meet the thresholds of the
+    /// conclusion.
+    pub(crate) fn justifies(
+        self,
+        thresholds: Thresholds,
+        outcome: Outcome,
+        support: &[(Digest, Stake)],
+        voted: Stake,
+    ) -> bool {
+        match (self, outcome) {
+            (Self::Baseline | Self::SuiBaseline | Self::A, _) => false,
+            (Self::B, Outcome::Finalize(finalized)) => support
+                .iter()
+                .any(|&(attested, stake)| attested == finalized && stake >= thresholds.validity),
+            (Self::B, Outcome::Skip) => {
+                voted >= thresholds.quorum
+                    && support
+                        .iter()
+                        .all(|&(_, stake)| stake < thresholds.validity)
+            }
         }
     }
 
     /// Whether votes count as their blocks arrive, before commit.
     pub fn counts_arrivals(self) -> bool {
-        self == Self::SuiBaseline
+        matches!(self, Self::SuiBaseline | Self::B)
+    }
+
+    /// Whether tallies conclude in certificates, which decide once committed, rather than in
+    /// decisions.
+    pub(crate) fn certifies(self) -> bool {
+        self == Self::B
     }
 
     /// Whether the protocol decides on f+1 votes.
     pub fn needs_validity(self) -> bool {
-        self == Self::A
+        matches!(self, Self::A | Self::B)
     }
 }
 
@@ -65,6 +102,7 @@ impl fmt::Display for FinalityProtocol {
             Self::Baseline => write!(f, "baseline"),
             Self::SuiBaseline => write!(f, "sui-baseline"),
             Self::A => write!(f, "a"),
+            Self::B => write!(f, "b"),
         }
     }
 }

@@ -8,7 +8,7 @@
 
 use std::{fs, path::Path, time::Duration};
 
-use checkpoint::certifier::CheckpointCertifier;
+use checkpoint::{certifier::CheckpointCertifier, finality::FinalityProtocol};
 use dag::{authority::Authority, context::TokioCtx};
 use execution::{fake::FakeExecutor, scheduler::SequentialScheduler, transaction::Transaction};
 use prometheus::Registry;
@@ -17,7 +17,10 @@ use replica::{
     config::{PrivateReplicaConfig, PublicReplicaConfig},
 };
 use tokio::time;
-use validator::validator::{ValidatorBuilder, ValidatorHandle};
+use validator::{
+    parameters::ValidatorParameters,
+    validator::{ValidatorBuilder, ValidatorHandle},
+};
 
 const COMMITTEE_SIZE: usize = 4;
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -32,15 +35,15 @@ pub struct Testbed {
 impl Testbed {
     /// Boots a committee with ephemeral storage.
     pub async fn start(port_offset: u16) -> Self {
-        Self::boot(None, port_offset).await
+        Self::boot(None, port_offset, FinalityProtocol::default()).await
     }
 
-    /// Boots a committee persisting each replica's WAL under `dir`.
-    pub async fn start_with_wal(dir: &Path, port_offset: u16) -> Self {
-        Self::boot(Some(dir), port_offset).await
+    /// Boots a committee deciding with `finality`, persisting each replica's WAL under `dir`.
+    pub async fn start_with_wal(dir: &Path, port_offset: u16, finality: FinalityProtocol) -> Self {
+        Self::boot(Some(dir), port_offset, finality).await
     }
 
-    async fn boot(dir: Option<&Path>, port_offset: u16) -> Self {
+    async fn boot(dir: Option<&Path>, port_offset: u16, finality: FinalityProtocol) -> Self {
         let public_config =
             PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE).with_port_offset(port_offset);
         let private_configs = PrivateReplicaConfig::new_for_benchmarks(
@@ -68,6 +71,10 @@ impl Testbed {
             )
             .with_storage(storage)
             .with_registry(registry)
+            .with_parameters(ValidatorParameters {
+                finality,
+                fork: None,
+            })
             .build()
             .expect("validator must build")
             .start::<TokioCtx>()

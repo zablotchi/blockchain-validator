@@ -4,11 +4,12 @@
 //! Full-committee restart: execution state is rebuilt by replaying the consensus WAL.
 //!
 //! Port offsets across test binaries: mysticeti uses 0-500, smoke.rs uses 3000, and this file
-//! uses 3100-3400 (a fresh offset per start avoids rebinding ports still in TIME_WAIT).
+//! uses 3100-3400 and 3700-4000 (a fresh offset per start avoids rebinding ports still in
+//! TIME_WAIT). Offset 3500 would bind port 5000, taken by macOS's AirPlay receiver.
 
 mod common;
 
-use checkpoint::checkpoint::Outcome;
+use checkpoint::{checkpoint::Outcome, finality::FinalityProtocol};
 use common::Testbed;
 use execution::{
     fake::FakeTransaction,
@@ -21,12 +22,24 @@ const STATE_UPDATES: usize = 3;
 
 #[tokio::test]
 async fn restarted_committee_recovers_execution_state() {
+    recovers_execution_state(FinalityProtocol::Baseline, 3100).await;
+}
+
+/// Replay rebuilds B's decisions from the certificates in the WAL.
+#[tokio::test]
+async fn restarted_committee_recovers_execution_state_under_protocol_b() {
+    recovers_execution_state(FinalityProtocol::B, 3900).await;
+}
+
+/// Runs a committee deciding with `finality` to quiescence, then restarts it on
+/// `port_offset + 100`.
+async fn recovers_execution_state(finality: FinalityProtocol, port_offset: u16) {
     let dir = tempfile::tempdir().expect("temporary directory");
     let id = ObjectId::new(1);
     let total = (STATE_UPDATES + 1) as u64;
 
     // First run: create an object and update it a few times.
-    let mut testbed = Testbed::start_with_wal(dir.path(), 3100).await;
+    let mut testbed = Testbed::start_with_wal(dir.path(), port_offset, finality).await;
     let mut transactions = vec![FakeTransaction::success(vec![], vec![id], vec![]).into()];
     transactions.extend(
         (0..STATE_UPDATES).map(|_| FakeTransaction::success(vec![], vec![], vec![id]).into()),
@@ -41,7 +54,7 @@ async fn restarted_committee_recovers_execution_state() {
     // Restart on the same WALs: replay must rebuild the executed count and the certified
     // watermark without new commits — the WAL's post-cut sub-dags carry only attestations,
     // which mint nothing.
-    let mut testbed = Testbed::start_with_wal(dir.path(), 3200).await;
+    let mut testbed = Testbed::start_with_wal(dir.path(), port_offset + 100, finality).await;
     testbed.wait_for_transactions(total).await;
     testbed.wait_for_decided().await;
     // Replay records nothing: the pre-restart certifications must not re-observe.
@@ -112,13 +125,25 @@ async fn restarted_committee_recovers_execution_state() {
 
 #[tokio::test]
 async fn restarted_committee_recertifies_lost_votes() {
+    recertifies_lost_votes(FinalityProtocol::Baseline, 3300).await;
+}
+
+/// Arrival tallies die with the process: certificates conclude again from re-attested votes.
+#[tokio::test]
+async fn restarted_committee_recertifies_lost_votes_under_protocol_b() {
+    recertifies_lost_votes(FinalityProtocol::B, 3700).await;
+}
+
+/// Halts a committee deciding with `finality` with votes in flight, then restarts it on
+/// `port_offset + 100`.
+async fn recertifies_lost_votes(finality: FinalityProtocol, port_offset: u16) {
     let dir = tempfile::tempdir().expect("temporary directory");
     let id = ObjectId::new(1);
     let total = (STATE_UPDATES + 1) as u64;
 
     // First run: halt as soon as everything executed. Votes still in flight die with the
     // transaction queue, leaving checkpoints that can never certify without re-attestation.
-    let mut testbed = Testbed::start_with_wal(dir.path(), 3300).await;
+    let mut testbed = Testbed::start_with_wal(dir.path(), port_offset, finality).await;
     let mut transactions = vec![FakeTransaction::success(vec![], vec![id], vec![]).into()];
     transactions.extend(
         (0..STATE_UPDATES).map(|_| FakeTransaction::success(vec![], vec![], vec![id]).into()),
@@ -136,7 +161,7 @@ async fn restarted_committee_recertifies_lost_votes() {
 
     // Restart: replay rebuilds the pending window, and re-attestation certifies it — waiting
     // here stalls forever if any lost vote is not resubmitted.
-    let mut testbed = Testbed::start_with_wal(dir.path(), 3400).await;
+    let mut testbed = Testbed::start_with_wal(dir.path(), port_offset + 100, finality).await;
     testbed.wait_for_transactions(total).await;
     testbed.wait_for_decided().await;
     let rebuilt = testbed.shutdown().await;

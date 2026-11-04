@@ -6,7 +6,7 @@
 use std::ops::Range;
 
 use bincode::Options;
-use checkpoint::checkpoint::Checkpoint;
+use checkpoint::checkpoint::{Certificate, Checkpoint};
 use execution::transaction::Transaction;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,8 @@ pub enum Payload {
     Execute(Transaction),
     /// A checkpoint vote bound for the certifier, attributed to the block author.
     Attest(Checkpoint),
+    /// A certificate concluded by its author's tally, bound for every certifier.
+    Certify(Certificate),
 }
 
 impl Envelope {
@@ -82,7 +84,7 @@ impl Envelope {
         }
         match Self::from_bytes(bytes).ok()?.into_payload() {
             Payload::Attest(checkpoint) => Some(checkpoint),
-            Payload::Execute(_) => None,
+            Payload::Execute(_) | Payload::Certify(_) => None,
         }
     }
 }

@@ -45,12 +45,48 @@ impl Checkpoint {
 }
 
 /// What the committee decided at one checkpoint height.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Debug)]
 pub enum Outcome {
     /// The committee agrees on the execution state at this height.
     Finalize(Digest),
     /// No commitment can gather enough support; the height is passed over.
     Skip,
+}
+
+/// A claimed outcome for the checkpoint anchored at `anchor`, with the blocks carrying the
+/// votes that justify it. It verifies against committed votes alone, so it needs no signature
+/// of its own.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+pub struct Certificate {
+    anchor: BlockReference,
+    outcome: Outcome,
+    votes: Vec<BlockReference>,
+}
+
+impl Certificate {
+    pub(crate) fn new(
+        anchor: BlockReference,
+        outcome: Outcome,
+        votes: Vec<BlockReference>,
+    ) -> Self {
+        Self {
+            anchor,
+            outcome,
+            votes,
+        }
+    }
+
+    pub fn anchor(&self) -> BlockReference {
+        self.anchor
+    }
+
+    pub fn outcome(&self) -> Outcome {
+        self.outcome
+    }
+
+    pub fn votes(&self) -> &[BlockReference] {
+        &self.votes
+    }
 }
 
 /// A decided checkpoint height: its outcome and the block carrying each vote backing it.

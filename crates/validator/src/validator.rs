@@ -208,7 +208,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 let timestamp_ms = C::timestamp_utc().as_millis() as u64;
                 let attestations = pending
                     .into_iter()
-                    .map(|checkpoint| Self::attestation(timestamp_ms, checkpoint))
+                    .map(|checkpoint| Self::wrap(timestamp_ms, Payload::Attest(checkpoint)))
                     .collect();
                 if client.submit(attestations).await.is_err() {
                     tracing::debug!("re-attestation failed; shutting down");
@@ -217,32 +217,44 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
 
             let mut count = replayed;
             while let Some(event) = receiver.recv().await {
-                let subdag = match event {
+                let now = C::timestamp_utc();
+                let minted = match event {
                     DagEvent::Block(block) => {
-                        if state.count_arrivals(&driver_metrics, C::timestamp_utc(), &block) {
+                        if state.count_arrivals(&driver_metrics, now, &block) {
                             let _ = decided_sender.send(state.decided_everything());
                         }
-                        continue;
+                        None
                     }
-                    DagEvent::Commit(subdag) => subdag,
+                    DagEvent::Commit(subdag) => {
+                        // The clock starts at delivery (idle waiting is not latency) and stops
+                        // after execution, checkpoint minting, and vote recording.
+                        let start = C::now();
+                        let (executed, minted) = state.execute_subdag(&driver_metrics, now, subdag);
+                        driver_metrics.observe_subdag_execution_latency(C::elapsed(&start));
+                        count += executed as u64;
+                        let _ = executed_sender.send(count);
+                        let _ = decided_sender.send(state.decided_everything());
+                        minted
+                    }
                 };
-                // The clock starts at delivery (idle waiting is not latency) and stops after
-                // execution, checkpoint minting, and vote recording.
-                let start = C::now();
-                let now = C::timestamp_utc();
-                let (executed, minted) = state.execute_subdag(&driver_metrics, now, subdag);
-                driver_metrics.observe_subdag_execution_latency(C::elapsed(&start));
-                count += executed as u64;
-                let _ = executed_sender.send(count);
-                let _ = decided_sender.send(state.decided_everything());
-                // Attest to the minted checkpoint through consensus: the vote rides this
-                // validator's own signed blocks. Failure is benign — the replica is shutting
-                // down, and lost votes are resubmitted after replay.
-                if let Some(checkpoint) = minted {
-                    let attestation = Self::attestation(now.as_millis() as u64, checkpoint);
-                    if client.submit(vec![attestation]).await.is_err() {
-                        tracing::debug!("attestation submission failed; shutting down");
-                    }
+                // Attest to the minted checkpoint and submit concluded certificates through
+                // consensus: both ride this validator's own signed blocks. Failure is benign —
+                // the replica is shutting down, lost votes are resubmitted after replay, and
+                // certificates conclude again from them.
+                let payloads: Vec<_> = minted
+                    .map(Payload::Attest)
+                    .into_iter()
+                    .chain(
+                        state
+                            .certifier
+                            .take_certificates()
+                            .into_iter()
+                            .map(Payload::Certify),
+                    )
+                    .map(|payload| Self::wrap(now.as_millis() as u64, payload))
+                    .collect();
+                if !payloads.is_empty() && client.submit(payloads).await.is_err() {
+                    tracing::debug!("submission failed; shutting down");
                 }
             }
             (state.scheduler, state.certifier)
@@ -292,21 +304,20 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         Ok(replayed)
     }
 
-    /// Wraps a checkpoint as this validator's timestamped attestation payload.
-    fn attestation(timestamp_ms: u64, checkpoint: Checkpoint) -> ConsensusTransaction {
-        let envelope = Envelope::new(timestamp_ms, Payload::Attest(checkpoint));
-        ConsensusTransaction::new(envelope.to_bytes().into())
+    /// Wraps this validator's own payload, timestamped, for submission through consensus.
+    fn wrap(timestamp_ms: u64, payload: Payload) -> ConsensusTransaction {
+        ConsensusTransaction::new(Envelope::new(timestamp_ms, payload).to_bytes().into())
     }
 }
 
 impl<E: ExecutionEngine> ExecutionState<E> {
     /// Executes every transaction of a committed sub-dag in canonical order, dispatches its
-    /// checkpoint votes to the certifier, and returns how many transactions were executed
-    /// together with the checkpoint this sub-dag minted, if any. Undecodable payloads are
-    /// skipped; the choice is deterministic. Sub-dags that execute nothing are not
+    /// checkpoint votes and certificates to the certifier, and returns how many transactions
+    /// were executed together with the checkpoint this sub-dag minted, if any. Undecodable
+    /// payloads are skipped; the choice is deterministic. Sub-dags that execute nothing are not
     /// checkpointed: their commitment is unchanged, and their count varies across validators
     /// at any executed-transaction cut. `now` stamps the mint and closes the latency metrics
-    /// of checkpoints decided by the mint or this sub-dag's votes.
+    /// of checkpoints decided by the mint or this sub-dag's votes and certificates.
     fn execute_subdag(
         &mut self,
         metrics: &ValidatorMetrics,
@@ -316,6 +327,7 @@ impl<E: ExecutionEngine> ExecutionState<E> {
         let anchor = subdag.anchor;
         subdag.sort();
         let mut votes = Vec::new();
+        let mut certificates = Vec::new();
         // Submission stamps reduce to their sum here, while the payloads are in hand.
         let mut stamp_sum_ms = 0u64;
         let transactions = subdag
@@ -340,6 +352,10 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                     }
                     Payload::Attest(vote) => {
                         votes.push((block, vote));
+                        None
+                    }
+                    Payload::Certify(certificate) => {
+                        certificates.push(certificate);
                         None
                     }
                 }
@@ -368,6 +384,12 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 metrics.observe_decision(now, outcome, timings);
             }
         }
+        // Certificates cite votes from their causal history: committed by now, recorded above.
+        for certificate in certificates {
+            if let Some((outcome, timings)) = self.certifier.record_certificate(&certificate) {
+                metrics.observe_decision(now, outcome, timings);
+            }
+        }
         (executed, minted)
     }
 
@@ -383,7 +405,9 @@ impl<E: ExecutionEngine> ExecutionState<E> {
             let Some(vote) = Envelope::attestation_from_bytes(payload.as_bytes()) else {
                 continue;
             };
-            if let Some((outcome, timings)) = self.certifier.record(*block.reference(), vote) {
+            if let Some((outcome, timings)) =
+                self.certifier.record_arrival(*block.reference(), vote)
+            {
                 metrics.observe_decision(now, outcome, timings);
                 decided = true;
             }
@@ -652,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_a_rejects_consensus_quorums_other_than_2f_plus_1() {
+    fn f_plus_one_protocols_reject_consensus_quorums_other_than_2f_plus_1() {
         // Hybrid Mysticeti with no fault budget waits for all 4 validators, not 2f+1 = 3.
         let file = tempfile::NamedTempFile::new().unwrap();
         let consensus = "consensus:\n  protocol: hybrid-mysticeti\n  f: 0\n  c: 0\n";
@@ -676,6 +700,7 @@ mod tests {
             .build()
         };
         assert!(build(FinalityProtocol::A).is_err());
+        assert!(build(FinalityProtocol::B).is_err());
         assert!(build(FinalityProtocol::Baseline).is_ok());
         assert!(build(FinalityProtocol::SuiBaseline).is_ok());
     }
@@ -873,5 +898,36 @@ mod tests {
         assert_eq!(certification.get_sample_count(), 1);
         assert_eq!(certification.get_sample_sum(), 0.0);
         assert_eq!(metrics.end_to_end_latency_s().get_sample_count(), 1);
+    }
+
+    #[test]
+    fn protocol_b_decides_when_a_concluded_certificate_commits() {
+        let mut state = state(FinalityProtocol::B);
+        let metrics = metrics();
+        let (_, minted) = state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
+        let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
+
+        // f+1 arrivals conclude a certificate to submit, but decide nothing.
+        let votes = quorum_of_votes(2, &checkpoint);
+        for block in &votes[..2] {
+            assert!(!state.count_arrivals(&metrics, Duration::from_secs(1), block));
+        }
+        let certificates = state.certifier.take_certificates();
+        assert_eq!(certificates.len(), 1);
+        assert_eq!(state.certifier.highest_decided(), None);
+
+        // The certificate commits along with the votes it cites, ahead of them in the sub-dag.
+        let certify = Envelope::new(0, Payload::Certify(certificates[0].clone())).to_bytes();
+        let blocks = [vec![block(3, 2, vec![certify])], votes].concat();
+        let delivering = CommittedSubDag::new(*blocks[0].reference(), blocks);
+        state.execute_subdag(&metrics, Duration::from_secs(3), delivering);
+        let certified = state
+            .certifier
+            .highest_decided()
+            .expect("certificate must decide");
+        assert!(finalizes(certified, &checkpoint));
+        assert_eq!(certified.proof(), certificates[0].votes());
+        let certification = metrics.checkpoint_certification_latency_s(FINALIZE);
+        assert_eq!(certification.get_sample_sum(), 3.0);
     }
 }

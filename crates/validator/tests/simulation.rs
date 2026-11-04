@@ -341,29 +341,37 @@ fn decisions(committee: &SimulatedTestbed) -> Vec<(u64, u64)> {
 }
 
 #[test]
-fn protocol_a_skips_fragmented_heights_and_finalizes_the_rest() {
-    SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
-        let mut committee = generate_load(fragmented(FinalityProtocol::A)).await;
-        committee.wait_for_decided().await;
-        let decisions = decisions(&committee);
-        // Skipped transactions are never finalized: only finalized heights close end-to-end.
-        for (validator, (finalized, _)) in committee.validators().iter().zip(&decisions) {
-            let end_to_end = validator.metrics().end_to_end_latency_s();
-            assert_eq!(end_to_end.get_sample_count(), *finalized);
-        }
-        let results = committee.shutdown().await;
+fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
+    for finality in [FinalityProtocol::A, FinalityProtocol::B] {
+        SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
+            let mut committee = generate_load(fragmented(finality)).await;
+            committee.wait_for_decided().await;
+            let decisions = decisions(&committee);
+            // Skipped transactions are never finalized: only finalized heights close end to
+            // end.
+            for (validator, (finalized, _)) in committee.validators().iter().zip(&decisions) {
+                let end_to_end = validator.metrics().end_to_end_latency_s();
+                assert_eq!(end_to_end.get_sample_count(), *finalized, "{finality}");
+            }
+            let results = committee.shutdown().await;
 
-        let (_, reference) = &results[0];
-        for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
-            let minted = finalized + skipped;
-            assert!(
-                minted > FORK_PERIOD,
-                "the run must reach a fragmented height"
-            );
-            assert_eq!(skipped, minted / FORK_PERIOD);
-            assert_eq!(certifier.highest_decided(), reference.highest_decided());
-        }
-    });
+            // Decisions follow the commit sequence, proofs included.
+            let (_, reference) = &results[0];
+            for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
+                let minted = finalized + skipped;
+                assert!(
+                    minted > FORK_PERIOD,
+                    "the run must reach a fragmented height"
+                );
+                assert_eq!(skipped, minted / FORK_PERIOD, "{finality}");
+                assert_eq!(
+                    certifier.highest_decided(),
+                    reference.highest_decided(),
+                    "{finality}"
+                );
+            }
+        });
+    }
 }
 
 #[test]
