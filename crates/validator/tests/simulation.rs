@@ -8,7 +8,7 @@
 use std::{num::NonZeroU64, path::Path, sync::Arc, time::Duration};
 
 use checkpoint::{certifier::CheckpointCertifier, checkpoint::Outcome, finality::FinalityProtocol};
-use dag::{authority::Authority, context::Ctx, metrics::Metrics};
+use dag::{authority::Authority, block::BlockReference, context::Ctx, metrics::Metrics};
 use execution::{
     fake::{FakeExecutor, FakeTransaction},
     object::{ObjectId, Version},
@@ -27,7 +27,7 @@ use simulator::{
 use validator::{
     fork::ForkInjection,
     generator::LoadGeneratorConfig,
-    metrics::{FINALIZE, SKIP},
+    metrics::{FAST, FINALIZE, SKIP, SLOW},
     parameters::ValidatorParameters,
     validator::{ValidatorBuilder, ValidatorHandle},
 };
@@ -206,7 +206,7 @@ fn run_once(seed: u64) -> RunOutcome {
             // magnitudes are meaningful; each certified checkpoint observes both once.
             let certification = validator
                 .metrics()
-                .checkpoint_certification_latency_s(FINALIZE);
+                .checkpoint_certification_latency_s(FINALIZE, SLOW);
             let end_to_end = validator.metrics().end_to_end_latency_s();
             assert!(certification.get_sample_count() > 0);
             assert_eq!(
@@ -303,6 +303,7 @@ fn fragmented(finality: FinalityProtocol) -> ValidatorParameters {
     ValidatorParameters {
         finality,
         fork: Some(ForkInjection { groups, period }),
+        ..Default::default()
     }
 }
 
@@ -323,6 +324,18 @@ async fn generate_load(parameters: ValidatorParameters) -> SimulatedTestbed {
     committee
 }
 
+/// The decision latency histograms of `outcome` on either path.
+fn latencies(
+    validator: &ValidatorHandle<SimulatorContext, FakeExecutor>,
+    outcome: &str,
+) -> [prometheus::Histogram; 2] {
+    [FAST, SLOW].map(|path| {
+        validator
+            .metrics()
+            .checkpoint_certification_latency_s(outcome, path)
+    })
+}
+
 /// Each validator's count of finalized and skipped checkpoints.
 fn decisions(committee: &SimulatedTestbed) -> Vec<(u64, u64)> {
     committee
@@ -330,19 +343,33 @@ fn decisions(committee: &SimulatedTestbed) -> Vec<(u64, u64)> {
         .iter()
         .map(|validator| {
             let count = |outcome| {
-                validator
-                    .metrics()
-                    .checkpoint_certification_latency_s(outcome)
-                    .get_sample_count()
+                let histograms = latencies(validator, outcome);
+                histograms.iter().map(|h| h.get_sample_count()).sum()
             };
             (count(FINALIZE), count(SKIP))
         })
         .collect()
 }
 
+/// The last decision, as validators agree on it: under C they may decide a height on
+/// different paths, so with different proofs.
+fn last_decision(
+    finality: FinalityProtocol,
+    certifier: &CheckpointCertifier,
+) -> (BlockReference, Outcome, Option<Vec<BlockReference>>) {
+    let decision = certifier.highest_decided().expect("decided checkpoint");
+    let proof = (finality != FinalityProtocol::C).then(|| decision.proof().to_vec());
+    (decision.anchor(), decision.outcome(), proof)
+}
+
 #[test]
 fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
-    for finality in [FinalityProtocol::A, FinalityProtocol::B] {
+    let protocols = [
+        FinalityProtocol::A,
+        FinalityProtocol::B,
+        FinalityProtocol::C,
+    ];
+    for finality in protocols {
         SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
             let mut committee = generate_load(fragmented(finality)).await;
             committee.wait_for_decided().await;
@@ -352,10 +379,17 @@ fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
             for (validator, (finalized, _)) in committee.validators().iter().zip(&decisions) {
                 let end_to_end = validator.metrics().end_to_end_latency_s();
                 assert_eq!(end_to_end.get_sample_count(), *finalized, "{finality}");
+                // C finalizes on the fast path here, and skips only by the commit sequence.
+                if finality == FinalityProtocol::C {
+                    let [fast, _] = latencies(validator, FINALIZE);
+                    assert!(fast.get_sample_count() > 0);
+                    let [fast, _] = latencies(validator, SKIP);
+                    assert_eq!(fast.get_sample_count(), 0);
+                }
             }
             let results = committee.shutdown().await;
 
-            // Decisions follow the commit sequence, proofs included.
+            // Decisions follow the commit sequence, proofs included except under C.
             let (_, reference) = &results[0];
             for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
                 let minted = finalized + skipped;
@@ -365,8 +399,8 @@ fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
                 );
                 assert_eq!(skipped, minted / FORK_PERIOD, "{finality}");
                 assert_eq!(
-                    certifier.highest_decided(),
-                    reference.highest_decided(),
+                    last_decision(finality, certifier),
+                    last_decision(finality, reference),
                     "{finality}"
                 );
             }
@@ -403,7 +437,7 @@ fn certification_latencies(finality: FinalityProtocol) -> Vec<f64> {
     SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
         let parameters = ValidatorParameters {
             finality,
-            fork: None,
+            ..Default::default()
         };
         let mut committee = generate_load(parameters).await;
         committee.wait_for_decided().await;
@@ -411,10 +445,10 @@ fn certification_latencies(finality: FinalityProtocol) -> Vec<f64> {
             .validators()
             .iter()
             .map(|validator| {
-                let histogram = validator
-                    .metrics()
-                    .checkpoint_certification_latency_s(FINALIZE);
-                histogram.get_sample_sum() / histogram.get_sample_count() as f64
+                let histograms = latencies(validator, FINALIZE);
+                let sum: f64 = histograms.iter().map(|h| h.get_sample_sum()).sum();
+                let count: u64 = histograms.iter().map(|h| h.get_sample_count()).sum();
+                sum / count as f64
             })
             .collect();
         let results = committee.shutdown().await;
@@ -441,5 +475,60 @@ fn the_sui_baseline_decides_on_arrival_ahead_of_the_baseline() {
             sui < baseline,
             "the Sui-style baseline took {sui} s, the baseline {baseline} s"
         );
+    }
+}
+
+/// C's fast path waits for one more dissemination step than the Sui-style baseline, where A
+/// waits for f+1 votes to commit.
+#[test]
+fn protocol_c_decides_ahead_of_protocol_a() {
+    let a = certification_latencies(FinalityProtocol::A);
+    let c = certification_latencies(FinalityProtocol::C);
+    for (c, a) in c.iter().zip(&a) {
+        assert!(c < a, "C took {c} s, A {a} s");
+    }
+}
+
+#[test]
+fn protocol_c_skips_wait_out_the_phase_one_timeout_deterministically() {
+    // Not the default, which the driver would fall back to if the setting never reached it.
+    let timeout = Duration::from_secs(2);
+    let run = || {
+        SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
+            let parameters = ValidatorParameters {
+                phase_one_timeout: timeout,
+                ..fragmented(FinalityProtocol::C)
+            };
+            let mut committee = generate_load(parameters).await;
+            committee.wait_for_decided().await;
+            // Skips decide only after the phase-one timeout: their latencies time it.
+            let skips: Vec<_> = committee
+                .validators()
+                .iter()
+                .map(|validator| {
+                    let [_, slow] = latencies(validator, SKIP);
+                    (slow.get_sample_count(), slow.get_sample_sum())
+                })
+                .collect();
+            let results = committee.shutdown().await;
+            (skips, results.into_iter().map(|(_, certifier)| certifier))
+        })
+    };
+    let (first_skips, first) = run();
+    // Other validators' timeouts start at their own mints, so a skip can decide a little under
+    // one timeout after this validator's; committing the certificates more than makes up for
+    // it on average.
+    for &(count, sum) in &first_skips {
+        assert!(count > 0);
+        let mean = sum / count as f64;
+        assert!(
+            mean >= timeout.as_secs_f64(),
+            "skips took {mean} s on average"
+        );
+    }
+    let (second_skips, second) = run();
+    assert_eq!(first_skips, second_skips);
+    for (a, b) in first.zip(second) {
+        assert_eq!(a.highest_decided(), b.highest_decided());
     }
 }

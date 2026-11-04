@@ -15,7 +15,7 @@ use execution::{
     object::{ObjectId, Version},
     store::StateView,
 };
-use validator::metrics::FINALIZE;
+use validator::metrics::{FINALIZE, SLOW};
 
 #[tokio::test]
 async fn submitted_transactions_execute_identically_on_all_validators() {
@@ -43,7 +43,7 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
         assert!(histogram.get_sample_sum() > 0.0);
         let certification = validator
             .metrics()
-            .checkpoint_certification_latency_s(FINALIZE);
+            .checkpoint_certification_latency_s(FINALIZE, SLOW);
         assert!(certification.get_sample_count() > 0);
         assert!(certification.get_sample_sum() > 0.0);
         let end_to_end = validator.metrics().end_to_end_latency_s();

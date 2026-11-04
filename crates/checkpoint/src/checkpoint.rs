@@ -54,8 +54,8 @@ pub enum Outcome {
 }
 
 /// A claimed outcome for the checkpoint anchored at `anchor`, with the blocks carrying the
-/// votes that justify it. It verifies against committed votes alone, so it needs no signature
-/// of its own.
+/// votes that justify it: under C, a phase-one certificate if it finalizes. It verifies against
+/// the votes in its block's causal history alone, so it needs no signature of its own.
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 pub struct Certificate {
     anchor: BlockReference,
@@ -89,7 +89,8 @@ impl Certificate {
     }
 }
 
-/// A decided checkpoint height: its outcome and the block carrying each vote backing it.
+/// A decided checkpoint height: its outcome and its proof, the blocks carrying the votes backing
+/// it or, when several certificates decided it (C's fast path and skips), those certificates.
 #[derive(PartialEq, Debug)]
 pub struct Decision {
     anchor: BlockReference,

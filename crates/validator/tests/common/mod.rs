@@ -8,7 +8,7 @@
 
 use std::{fs, path::Path, time::Duration};
 
-use checkpoint::{certifier::CheckpointCertifier, finality::FinalityProtocol};
+use checkpoint::certifier::CheckpointCertifier;
 use dag::{authority::Authority, context::TokioCtx};
 use execution::{fake::FakeExecutor, scheduler::SequentialScheduler, transaction::Transaction};
 use prometheus::Registry;
@@ -22,7 +22,7 @@ use validator::{
     validator::{ValidatorBuilder, ValidatorHandle},
 };
 
-const COMMITTEE_SIZE: usize = 4;
+pub const COMMITTEE_SIZE: usize = 4;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A committee of validators running on the local tokio network.
@@ -35,15 +35,19 @@ pub struct Testbed {
 impl Testbed {
     /// Boots a committee with ephemeral storage.
     pub async fn start(port_offset: u16) -> Self {
-        Self::boot(None, port_offset, FinalityProtocol::default()).await
+        Self::boot(None, port_offset, &ValidatorParameters::default()).await
     }
 
-    /// Boots a committee deciding with `finality`, persisting each replica's WAL under `dir`.
-    pub async fn start_with_wal(dir: &Path, port_offset: u16, finality: FinalityProtocol) -> Self {
-        Self::boot(Some(dir), port_offset, finality).await
+    /// Boots a committee running with `parameters`, persisting each replica's WAL under `dir`.
+    pub async fn start_with_wal(
+        dir: &Path,
+        port_offset: u16,
+        parameters: &ValidatorParameters,
+    ) -> Self {
+        Self::boot(Some(dir), port_offset, parameters).await
     }
 
-    async fn boot(dir: Option<&Path>, port_offset: u16, finality: FinalityProtocol) -> Self {
+    async fn boot(dir: Option<&Path>, port_offset: u16, parameters: &ValidatorParameters) -> Self {
         let public_config =
             PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE).with_port_offset(port_offset);
         let private_configs = PrivateReplicaConfig::new_for_benchmarks(
@@ -71,10 +75,7 @@ impl Testbed {
             )
             .with_storage(storage)
             .with_registry(registry)
-            .with_parameters(ValidatorParameters {
-                finality,
-                fork: None,
-            })
+            .with_parameters(parameters.clone())
             .build()
             .expect("validator must build")
             .start::<TokioCtx>()
@@ -121,6 +122,33 @@ impl Testbed {
                 .await
                 .expect("timed out waiting for decisions");
         }
+    }
+
+    /// Waits until every validator delivered `count` more committed sub-dags than now: by then,
+    /// whatever was submitted before has committed.
+    pub async fn wait_for_commits(&mut self, count: u64) {
+        let delivered = |validator: &ValidatorHandle<TokioCtx, FakeExecutor>| {
+            let histogram = validator.metrics().subdag_execution_latency_s();
+            histogram.get_sample_count()
+        };
+        let targets: Vec<_> = self
+            .validators
+            .iter()
+            .map(|validator| delivered(validator) + count)
+            .collect();
+        let committed = async {
+            while !self
+                .validators
+                .iter()
+                .zip(&targets)
+                .all(|(validator, target)| delivered(validator) >= *target)
+            {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        time::timeout(TIMEOUT, committed)
+            .await
+            .expect("timed out waiting for commits");
     }
 
     /// Stops every validator and returns the schedulers with their executed state and

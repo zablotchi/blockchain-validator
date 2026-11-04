@@ -14,10 +14,11 @@ use serde::{Deserialize, Serialize};
 /// can request, since payload bytes come from untrusted clients via consensus.
 pub const MAX_PAYLOAD_SIZE: u64 = 1024 * 1024;
 
-/// Where fixint bincode puts the payload's variant index, after the timestamp, and its value
-/// for [`Payload::Attest`].
+/// Where fixint bincode puts the payload's variant index, after the timestamp, and its values
+/// for [`Payload::Attest`] and [`Payload::Certify`].
 const TAG: Range<usize> = 8..12;
 const ATTEST_TAG: [u8; 4] = 1u32.to_le_bytes();
+const CERTIFY_TAG: [u8; 4] = 2u32.to_le_bytes();
 
 /// What every consensus payload carries: the submission timestamp, then the payload proper.
 ///
@@ -79,13 +80,27 @@ impl Envelope {
     /// Decodes the checkpoint vote in consensus payload bytes, if they carry one. Other
     /// payloads are told apart by their variant tag, without decoding them.
     pub(crate) fn attestation_from_bytes(bytes: &[u8]) -> Option<Checkpoint> {
-        if bytes.get(TAG) != Some(&ATTEST_TAG[..]) {
-            return None;
-        }
-        match Self::from_bytes(bytes).ok()?.into_payload() {
+        match Self::tagged_from_bytes(bytes, ATTEST_TAG)? {
             Payload::Attest(checkpoint) => Some(checkpoint),
             Payload::Execute(_) | Payload::Certify(_) => None,
         }
+    }
+
+    /// Decodes the certificate in consensus payload bytes, like
+    /// [`attestation_from_bytes`](Envelope::attestation_from_bytes).
+    pub(crate) fn certificate_from_bytes(bytes: &[u8]) -> Option<Certificate> {
+        match Self::tagged_from_bytes(bytes, CERTIFY_TAG)? {
+            Payload::Certify(certificate) => Some(certificate),
+            Payload::Execute(_) | Payload::Attest(_) => None,
+        }
+    }
+
+    /// Decodes the payload in consensus payload bytes if its variant tag is `tag`.
+    fn tagged_from_bytes(bytes: &[u8], tag: [u8; 4]) -> Option<Payload> {
+        if bytes.get(TAG) != Some(&tag[..]) {
+            return None;
+        }
+        Some(Self::from_bytes(bytes).ok()?.into_payload())
     }
 }
 

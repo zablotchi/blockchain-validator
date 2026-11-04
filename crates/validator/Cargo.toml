@@ -11,16 +11,16 @@ checkpoint.workspace = true
 dag.workspace = true
 execution.workspace = true
 eyre.workspace = true
-humantime-serde = { workspace = true, optional = true }
+humantime-serde.workspace = true
 prometheus.workspace = true
 rand = { workspace = true, optional = true }
 replica.workspace = true
 serde.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 tracing.workspace = true
 
 [features]
-benchmark = ["dep:humantime-serde", "dep:rand", "execution/test-utils"]
+benchmark = ["dep:rand", "execution/test-utils"]
 
 [dev-dependencies]
 checkpoint = { workspace = true, features = ["test-utils"] }

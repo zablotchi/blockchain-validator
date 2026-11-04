@@ -24,6 +24,14 @@ pub const LABEL_OUTCOME: &str = "outcome";
 pub const FINALIZE: &str = "finalize";
 pub const SKIP: &str = "skip";
 
+/// The `path` label of [`CHECKPOINT_CERTIFICATION_LATENCY_S`], what decided the checkpoint,
+/// and its values.
+pub const LABEL_PATH: &str = "path";
+/// Votes or certificates as their blocks entered the local DAG.
+pub const FAST: &str = "fast";
+/// The commit sequence.
+pub const SLOW: &str = "slow";
+
 /// Mysticeti's consensus-latency buckets: dense around the expected commit latency.
 const LATENCY_SEC_BUCKETS: &[f64] = &[
     0.1, 0.2, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1., 1.25, 1.5, 1.75, 2., 3.0, 5., 10.,
@@ -57,7 +65,7 @@ impl ValidatorMetrics {
             checkpoint_certification_latency_s: register_histogram_vec_with_registry!(
                 CHECKPOINT_CERTIFICATION_LATENCY_S,
                 "Checkpoint creation to decision (finalize or skip) latency (s)",
-                &[LABEL_OUTCOME],
+                &[LABEL_OUTCOME, LABEL_PATH],
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
             )
@@ -81,19 +89,21 @@ impl ValidatorMetrics {
             .observe(latency.as_secs_f64());
     }
 
-    /// Closes the latency metrics of a checkpoint decided at `now`. Skipped transactions are
-    /// never finalized, so only finalized checkpoints close end to end.
+    /// Closes the latency metrics of a checkpoint decided at `now` on `path` ([`FAST`] or
+    /// [`SLOW`]). Skipped transactions are never finalized, so only finalized checkpoints close
+    /// end to end.
     pub(crate) fn observe_decision(
         &self,
         now: Duration,
         outcome: Outcome,
+        path: &str,
         timings: CheckpointTimings,
     ) {
         let label = match outcome {
             Outcome::Finalize(_) => FINALIZE,
             Outcome::Skip => SKIP,
         };
-        self.checkpoint_certification_latency_s(label)
+        self.checkpoint_certification_latency_s(label, path)
             .observe(now.saturating_sub(timings.minted_at).as_secs_f64());
         if let Outcome::Finalize(_) = outcome {
             let submitted = Duration::from_millis(timings.mean_timestamp_ms);
@@ -111,10 +121,10 @@ impl ValidatorMetrics {
         &self.subdag_execution_latency_s
     }
 
-    /// The decision latency of one `outcome` label value.
-    pub fn checkpoint_certification_latency_s(&self, outcome: &str) -> Histogram {
+    /// The decision latency of one `outcome` and `path` label pair.
+    pub fn checkpoint_certification_latency_s(&self, outcome: &str, path: &str) -> Histogram {
         self.checkpoint_certification_latency_s
-            .with_label_values(&[outcome])
+            .with_label_values(&[outcome, path])
     }
 
     pub fn end_to_end_latency_s(&self) -> &Histogram {

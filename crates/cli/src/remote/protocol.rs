@@ -39,11 +39,12 @@ pub struct NodeParameters {
 
 impl Debug for NodeParameters {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:?}-{}",
-            self.replica.consensus, self.validator.finality
-        )?;
+        let finality = self.validator.finality;
+        write!(f, "{:?}-{finality}", self.replica.consensus)?;
+        if finality.times_out() {
+            let timeout = self.validator.phase_one_timeout;
+            write!(f, "-timeout-{}ms", timeout.as_millis())?;
+        }
         if let Some(fork) = &self.validator.fork {
             let groups: Vec<_> = fork
                 .groups
@@ -335,6 +336,24 @@ mod tests {
         assert_eq!(
             format!("{parameters:?}"),
             "mysticeti-l1-a-fork-1.2_3-every-5"
+        );
+    }
+
+    #[test]
+    fn node_parameters_name_the_phase_one_timeout_of_protocols_timing_out() {
+        let name = |validator: &str| {
+            let yaml = format!("{CONSENSUS}{validator}");
+            let parameters: NodeParameters = serde_yaml::from_str(&yaml).unwrap();
+            format!("{parameters:?}")
+        };
+        assert_eq!(name("finality: c\n"), "mysticeti-l1-c-timeout-1000ms");
+        assert_eq!(
+            name("finality: c\nphase_one_timeout: 250ms\n"),
+            "mysticeti-l1-c-timeout-250ms"
+        );
+        assert_eq!(
+            name("finality: b\nphase_one_timeout: 250ms\n"),
+            "mysticeti-l1-b"
         );
     }
 
