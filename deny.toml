@@ -92,7 +92,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = [
   # The mysticeti consensus crates (dag, replica, simulator) are pinned to a rev.
-  "https://github.com/asonnino/mysticeti",
+  "https://github.com/zablotchi/mysticeti",
 ]
 
 [sources.allow-org]

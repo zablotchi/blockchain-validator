@@ -1023,6 +1023,7 @@ dependencies = [
 [[package]]
 name = "consensus"
 version = "0.1.0"
+source = "git+https://github.com/zablotchi/mysticeti?rev=4ea82a774d4657733d9cdb5a04ba87e9696908c6#4ea82a774d4657733d9cdb5a04ba87e9696908c6"
 dependencies = [
  "blake2 0.11.0",
  "dag",
@@ -1274,6 +1275,7 @@ dependencies = [
 [[package]]
 name = "dag"
 version = "0.1.0"
+source = "git+https://github.com/zablotchi/mysticeti?rev=4ea82a774d4657733d9cdb5a04ba87e9696908c6#4ea82a774d4657733d9cdb5a04ba87e9696908c6"
 dependencies = [
  "bincode",
  "blake2 0.11.0",
@@ -2593,6 +2595,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 [[package]]
 name = "minibytes"
 version = "0.1.0"
+source = "git+https://github.com/zablotchi/mysticeti?rev=4ea82a774d4657733d9cdb5a04ba87e9696908c6#4ea82a774d4657733d9cdb5a04ba87e9696908c6"
 dependencies = [
  "memmap2",
  "serde",
@@ -2734,6 +2737,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 [[package]]
 name = "orchestrator"
 version = "0.0.1"
+source = "git+https://github.com/zablotchi/mysticeti?rev=4ea82a774d4657733d9cdb5a04ba87e9696908c6#4ea82a774d4657733d9cdb5a04ba87e9696908c6"
 dependencies = [
  "aws-config",
  "aws-runtime",
@@ -3415,6 +3419,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 [[package]]
 name = "replica"
 version = "0.1.0"
+source = "git+https://github.com/zablotchi/mysticeti?rev=4ea82a774d4657733d9cdb5a04ba87e9696908c6#4ea82a774d4657733d9cdb5a04ba87e9696908c6"
 dependencies = [
  "axum",
  "blake2 0.11.0",
@@ -4114,6 +4119,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 [[package]]
 name = "simulator"
 version = "0.1.0"
+source = "git+https://github.com/zablotchi/mysticeti?rev=4ea82a774d4657733d9cdb5a04ba87e9696908c6#4ea82a774d4657733d9cdb5a04ba87e9696908c6"
 dependencies = [
  "consensus",
  "dag",
