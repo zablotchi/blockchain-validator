@@ -4,7 +4,12 @@
 //! The remote benchmark driver: composes the orchestrator's phases per load and reports
 //! progress through plain tracing lines.
 
-use std::fs;
+use std::{
+    fmt::Debug,
+    fs::{self, File},
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use eyre::{Context, Result};
 use orchestrator::{
@@ -218,7 +223,7 @@ impl RemoteBenchmarkDriver {
             .results_dir
             .join(format!("results-{}", self.settings.repository.commit));
         fs::create_dir_all(&results_dir).wrap_err("Failed to create results directory")?;
-        let measurements_path = results_dir.join(format!("measurements-{parameters:?}.yaml"));
+        let mut measurements = MeasurementsFile::new(&results_dir, parameters, SystemTime::now());
 
         loop {
             let tick = tokio::select! {
@@ -251,13 +256,10 @@ impl RemoteBenchmarkDriver {
                         "Benchmark tick"
                     );
                     if let Some(yaml) = results {
-                        // Each tick rewrites the file with a full scrape; a torn write is
-                        // repaired by the next tick.
-                        fs::write(&measurements_path, yaml)
-                            .wrap_err("Failed to save benchmark results")?;
+                        measurements.write(&yaml)?;
                     }
                     if !indefinite && elapsed > benchmark_duration {
-                        tracing::info!("Results in {}", measurements_path.display());
+                        tracing::info!("Results in {}", measurements.path.display());
                         return Ok(());
                     }
                 }
@@ -268,5 +270,74 @@ impl RemoteBenchmarkDriver {
                 }
             }
         }
+    }
+}
+
+/// One run's results, `measurements-{parameters:?}-{start}.yaml` with the run's UTC start to
+/// the second (`20231114T221320Z`). The parameters part is readable but not unique
+/// (configurations can share it, repeats always do), so the start gives every run its own
+/// file, and a run fails rather than overwrite one. Analysis groups runs by the parameters
+/// stored in each file, never by its name.
+struct MeasurementsFile {
+    path: PathBuf,
+    created: bool,
+}
+
+impl MeasurementsFile {
+    fn new(results_dir: &Path, parameters: &impl Debug, start: SystemTime) -> Self {
+        let start = humantime::format_rfc3339_seconds(start)
+            .to_string()
+            .replace(['-', ':'], "");
+        let path = results_dir.join(format!("measurements-{parameters:?}-{start}.yaml"));
+        Self {
+            path,
+            created: false,
+        }
+    }
+
+    /// Each write replaces the previous scrape, so a torn write is repaired by the next one.
+    fn write(&mut self, yaml: &str) -> Result<()> {
+        if !self.created {
+            File::create_new(&self.path)
+                .wrap_err_with(|| format!("Failed to create {}", self.path.display()))?;
+            self.created = true;
+        }
+        fs::write(&self.path, yaml).wrap_err("Failed to save benchmark results")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        time::{Duration, SystemTime},
+    };
+
+    use crate::remote::{benchmark::MeasurementsFile, protocol::NodeParameters};
+
+    #[test]
+    fn every_run_gets_its_own_measurements_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let parameters = NodeParameters::default();
+        let second = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let start = second + Duration::from_millis(500);
+
+        let mut run = MeasurementsFile::new(dir.path(), &parameters, start);
+        let expected = format!("measurements-{parameters:?}-20231114T221320Z.yaml");
+        assert_eq!(run.path, dir.path().join(expected));
+        run.write("first scrape").unwrap();
+        run.write("second scrape").unwrap();
+
+        let later = start + Duration::from_secs(1);
+        let mut repeat = MeasurementsFile::new(dir.path(), &parameters, later);
+        repeat.write("repeat").unwrap();
+
+        // Another run started within the same second.
+        let mut clash = MeasurementsFile::new(dir.path(), &parameters, second);
+        assert!(clash.write("clash").is_err());
+
+        assert_eq!(fs::read_to_string(&run.path).unwrap(), "second scrape");
+        assert_eq!(fs::read_to_string(&repeat.path).unwrap(), "repeat");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 }

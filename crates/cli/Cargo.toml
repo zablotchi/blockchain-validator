@@ -14,6 +14,7 @@ clap.workspace = true
 dag.workspace = true
 execution = { workspace = true, features = ["test-utils"] }
 eyre.workspace = true
+humantime.workspace = true
 orchestrator.workspace = true
 replica.workspace = true
 serde.workspace = true
@@ -23,3 +24,6 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 validator = { workspace = true, features = ["benchmark"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -27,8 +27,8 @@ const LOAD_GENERATOR_CONFIG_FILENAME: &str = LoadGeneratorConfig::DEFAULT_FILENA
 const VALIDATOR_PARAMETERS_FILENAME: &str = ValidatorParameters::DEFAULT_FILENAME;
 
 /// The parameters distributed to every validator: the replica's and the validator's, side by
-/// side in one flat file. The `Debug` output keys the benchmark's measurement files, so it
-/// must stay short and filesystem-safe.
+/// side in one flat file. The `Debug` output is the readable part of the benchmark's file
+/// names, so it must stay short and filesystem-safe.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct NodeParameters {
     #[serde(flatten)]
@@ -42,19 +42,15 @@ impl Debug for NodeParameters {
         let finality = self.validator.finality;
         write!(f, "{:?}-{finality}", self.replica.consensus)?;
         if finality.times_out() {
+            // Never rounded: whole microseconds unless the timeout is finer.
             let timeout = self.validator.phase_one_timeout;
-            write!(f, "-timeout-{}ms", timeout.as_millis())?;
+            match timeout.as_nanos() % 1_000 {
+                0 => write!(f, "-timeout-{}us", timeout.as_micros())?,
+                _ => write!(f, "-timeout-{}ns", timeout.as_nanos())?,
+            }
         }
         if let Some(fork) = &self.validator.fork {
-            let groups: Vec<_> = fork
-                .groups
-                .iter()
-                .map(|group| {
-                    let members: Vec<_> = group.iter().map(|a| a.index().to_string()).collect();
-                    members.join(".")
-                })
-                .collect();
-            write!(f, "-fork-{}-every-{}", groups.join("_"), fork.period)?;
+            write!(f, "-fork-{}g-every-{}", fork.groups.len(), fork.period)?;
         }
         Ok(())
     }
@@ -362,27 +358,35 @@ mod tests {
 
     const CONSENSUS: &str = "consensus:\n  protocol: mysticeti\n  leader_count: 1\n";
 
+    fn name(validator: &str) -> String {
+        let yaml = format!("{CONSENSUS}{validator}");
+        let parameters: NodeParameters = serde_yaml::from_str(&yaml).unwrap();
+        format!("{parameters:?}")
+    }
+
     #[test]
     fn node_parameters_name_the_finality_protocol_and_forks() {
-        let yaml = format!("{CONSENSUS}finality: a\nfork:\n  groups: [[1, 2], [3]]\n  period: 5\n");
-        let parameters: NodeParameters = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(
-            format!("{parameters:?}"),
-            "mysticeti-l1-a-fork-1.2_3-every-5"
+            name("finality: a\nfork:\n  groups: [[1, 2], [3]]\n  period: 5\n"),
+            "mysticeti-l1-a-fork-2g-every-5"
         );
     }
 
     #[test]
+    fn node_parameters_name_many_fork_groups_briefly() {
+        let groups: Vec<_> = (1..=99).map(|i| format!("[{i}]")).collect();
+        let fork = format!("fork:\n  groups: [{}]\n  period: 5\n", groups.join(", "));
+        let name = name(&format!("finality: c\n{fork}"));
+        assert_eq!(name, "mysticeti-l1-c-timeout-1000000us-fork-99g-every-5");
+        assert!(name.len() < 120);
+    }
+
+    #[test]
     fn node_parameters_name_the_phase_one_timeout_of_protocols_timing_out() {
-        let name = |validator: &str| {
-            let yaml = format!("{CONSENSUS}{validator}");
-            let parameters: NodeParameters = serde_yaml::from_str(&yaml).unwrap();
-            format!("{parameters:?}")
-        };
-        assert_eq!(name("finality: c\n"), "mysticeti-l1-c-timeout-1000ms");
+        assert_eq!(name("finality: c\n"), "mysticeti-l1-c-timeout-1000000us");
         assert_eq!(
             name("finality: c\nphase_one_timeout: 250ms\n"),
-            "mysticeti-l1-c-timeout-250ms"
+            "mysticeti-l1-c-timeout-250000us"
         );
         assert_eq!(
             name("finality: b\nphase_one_timeout: 250ms\n"),
@@ -391,8 +395,19 @@ mod tests {
     }
 
     #[test]
+    fn node_parameters_name_the_phase_one_timeout_unrounded() {
+        assert_eq!(
+            name("finality: c\nphase_one_timeout: 250ms 500us\n"),
+            "mysticeti-l1-c-timeout-250500us"
+        );
+        assert_eq!(
+            name("finality: c\nphase_one_timeout: 250ms 1ns\n"),
+            "mysticeti-l1-c-timeout-250000001ns"
+        );
+    }
+
+    #[test]
     fn node_parameters_without_validator_fields_run_the_baseline() {
-        let parameters: NodeParameters = serde_yaml::from_str(CONSENSUS).unwrap();
-        assert_eq!(format!("{parameters:?}"), "mysticeti-l1-baseline");
+        assert_eq!(name(""), "mysticeti-l1-baseline");
     }
 }
