@@ -12,11 +12,11 @@ use std::{
 
 use checkpoint::{certifier::CheckpointTimings, checkpoint::Outcome};
 use prometheus::{
-    Histogram, HistogramVec, IntCounter, Registry,
+    Histogram, HistogramVec, IntCounter, IntGauge, Registry,
     core::{Collector, Desc},
     proto::{Counter, LabelPair, Metric, MetricFamily, MetricType},
     register_histogram_vec_with_registry, register_histogram_with_registry,
-    register_int_counter_with_registry,
+    register_int_counter_with_registry, register_int_gauge_with_registry,
 };
 
 // Metric names, public for scrapers. The counters are prefixed because the replica already
@@ -29,9 +29,12 @@ pub const CLIENT_COMMIT_LATENCY_S: &str = "client_commit_latency_s";
 pub const SUBDAG_EXECUTION_LATENCY_S: &str = "subdag_execution_latency_s";
 pub const CHECKPOINT_CERTIFICATION_LATENCY_S: &str = "checkpoint_certification_latency_s";
 pub const END_TO_END_LATENCY_S: &str = "end_to_end_latency_s";
+pub const CHECKPOINT_FINALITY_LATENCY_S: &str = "checkpoint_finality_latency_s";
+pub const CHECKPOINT_PENDING_HEIGHTS: &str = "checkpoint_pending_heights";
 pub const CHECKPOINT_DECISION_ACCOUNTING: &str = "checkpoint_decision_accounting_total";
 
-/// The `outcome` label of [`CHECKPOINT_CERTIFICATION_LATENCY_S`] and its values.
+/// The `outcome` label of [`CHECKPOINT_CERTIFICATION_LATENCY_S`] and
+/// [`CHECKPOINT_FINALITY_LATENCY_S`], and its values.
 pub const LABEL_OUTCOME: &str = "outcome";
 pub const FINALIZE: &str = "finalize";
 pub const SKIP: &str = "skip";
@@ -61,6 +64,8 @@ pub struct ValidatorMetrics {
     client_commit_latency_s: Histogram,
     subdag_execution_latency_s: Histogram,
     checkpoint_certification_latency_s: HistogramVec,
+    checkpoint_finality_latency_s: HistogramVec,
+    checkpoint_pending_heights: IntGauge,
     end_to_end_latency_s: Histogram,
     decision_accounting: DecisionAccounting,
 }
@@ -108,9 +113,23 @@ impl ValidatorMetrics {
                 registry,
             )
             .unwrap(),
+            checkpoint_finality_latency_s: register_histogram_vec_with_registry!(
+                CHECKPOINT_FINALITY_LATENCY_S,
+                "Checkpoint creation to contiguous decision (the watermark passing it) latency (s)",
+                &[LABEL_OUTCOME],
+                LATENCY_SEC_BUCKETS.to_vec(),
+                registry,
+            )
+            .unwrap(),
+            checkpoint_pending_heights: register_int_gauge_with_registry!(
+                CHECKPOINT_PENDING_HEIGHTS,
+                "Minted checkpoints not yet contiguously decided",
+                registry,
+            )
+            .unwrap(),
             end_to_end_latency_s: register_histogram_with_registry!(
                 END_TO_END_LATENCY_S,
-                "Submission to finalized-checkpoint inclusion latency (s)",
+                "Submission to contiguously finalized checkpoint latency (s)",
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
             )
@@ -132,9 +151,8 @@ impl ValidatorMetrics {
             .observe(latency.as_secs_f64());
     }
 
-    /// Closes the latency metrics of a checkpoint decided at `now` on `path` ([`FAST`] or
-    /// [`SLOW`]). Skipped transactions are never finalized, so only finalized checkpoints close
-    /// end to end.
+    /// Closes the decision metrics of a checkpoint decided at `now` on `path` ([`FAST`] or
+    /// [`SLOW`]).
     pub(crate) fn observe_decision(
         &self,
         now: Duration,
@@ -150,11 +168,31 @@ impl ValidatorMetrics {
         self.checkpoint_certification_latency_s(label, path)
             .observe(latency_s);
         self.decision_accounting.record(label, path, latency_s);
+    }
+
+    /// Closes the latency metrics of a checkpoint that became contiguously decided at `now`.
+    /// Skipped transactions are never finalized, so only finalized checkpoints close end to end.
+    pub(crate) fn observe_contiguous(
+        &self,
+        now: Duration,
+        outcome: Outcome,
+        timings: CheckpointTimings,
+    ) {
+        let label = match outcome {
+            Outcome::Finalize(_) => FINALIZE,
+            Outcome::Skip => SKIP,
+        };
+        self.checkpoint_finality_latency_s(label)
+            .observe(now.saturating_sub(timings.minted_at).as_secs_f64());
         if let Outcome::Finalize(_) = outcome {
             let submitted = Duration::from_millis(timings.mean_timestamp_ms);
             self.end_to_end_latency_s
                 .observe(now.saturating_sub(submitted).as_secs_f64());
         }
+    }
+
+    pub(crate) fn set_pending_heights(&self, pending: usize) {
+        self.checkpoint_pending_heights.set(pending as i64);
     }
 
     /// The raw metrics, for test assertions (`get`/`get_sample_count`/`get_sample_sum`).
@@ -178,6 +216,16 @@ impl ValidatorMetrics {
     pub fn checkpoint_certification_latency_s(&self, outcome: &str, path: &str) -> Histogram {
         self.checkpoint_certification_latency_s
             .with_label_values(&[outcome, path])
+    }
+
+    /// The contiguous-decision latency of one `outcome` label.
+    pub fn checkpoint_finality_latency_s(&self, outcome: &str) -> Histogram {
+        self.checkpoint_finality_latency_s
+            .with_label_values(&[outcome])
+    }
+
+    pub fn checkpoint_pending_heights(&self) -> &IntGauge {
+        &self.checkpoint_pending_heights
     }
 
     pub fn end_to_end_latency_s(&self) -> &Histogram {

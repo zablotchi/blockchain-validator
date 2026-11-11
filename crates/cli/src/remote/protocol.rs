@@ -277,6 +277,14 @@ impl ProtocolMetrics for ValidatorProtocol {
                 kind: MetricKind::Histogram,
             },
             MetricSpec {
+                name: validator::metrics::CHECKPOINT_FINALITY_LATENCY_S.into(),
+                kind: MetricKind::Histogram,
+            },
+            MetricSpec {
+                name: validator::metrics::CHECKPOINT_PENDING_HEIGHTS.into(),
+                kind: MetricKind::Gauge,
+            },
+            MetricSpec {
                 name: validator::metrics::SUBDAG_EXECUTION_LATENCY_S.into(),
                 kind: MetricKind::Histogram,
             },

@@ -118,9 +118,14 @@ async fn recovers_execution_state(finality: FinalityProtocol, port_offset: u16) 
     testbed.submit(0, vec![update]).await;
     testbed.wait_for_transactions(total + 1).await;
     testbed.wait_for_decided().await;
-    // Exactly the post-restart checkpoint observes.
+    // Exactly the post-restart checkpoint observes, contiguity included: replay drained the
+    // replayed heights into its discarded metrics.
     for validator in testbed.validators() {
         assert_eq!(finalized(validator), 1);
+        let metrics = validator.metrics();
+        let finality = metrics.checkpoint_finality_latency_s(FINALIZE);
+        assert_eq!(finality.get_sample_count(), 1);
+        assert_eq!(metrics.end_to_end_latency_s().get_sample_count(), 1);
     }
     let rebuilt = testbed.shutdown().await;
 

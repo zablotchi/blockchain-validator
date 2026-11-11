@@ -456,6 +456,7 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 metrics.observe_decision(now, outcome, SLOW, timings);
             }
         }
+        self.observe_contiguous(metrics, now, minted.is_some());
         (executed, minted)
     }
 
@@ -487,7 +488,24 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 decided = true;
             }
         }
+        if decided {
+            self.observe_contiguous(metrics, now, false);
+        }
         decided
+    }
+
+    /// Closes the latency metrics, at `now`, of the checkpoints that became contiguously
+    /// decided, and updates the pending-heights gauge if the window changed (`minted` or
+    /// popped).
+    fn observe_contiguous(&mut self, metrics: &ValidatorMetrics, now: Duration, minted: bool) {
+        let mut popped = false;
+        for (outcome, timings) in self.certifier.take_contiguous() {
+            metrics.observe_contiguous(now, outcome, timings);
+            popped = true;
+        }
+        if minted || popped {
+            metrics.set_pending_heights(self.certifier.pending().len());
+        }
     }
 
     /// Whether every minted checkpoint is decided, once one was minted; consumed by
@@ -905,6 +923,7 @@ mod tests {
         assert!(finalizes(certified, &checkpoint));
         // The prior checkpoint certified and was reclaimed; only the new mint is pending.
         assert_eq!(state.certifier.pending().count(), 1);
+        assert_eq!(metrics.checkpoint_pending_heights().get(), 1);
 
         // Certifying the second checkpoint closes its metrics from the update's stamp alone:
         // minted at 2s from a 0.5s submission, certified at 6s.
@@ -921,6 +940,11 @@ mod tests {
         let end_to_end = metrics.end_to_end_latency_s();
         assert_eq!(end_to_end.get_sample_count(), 2);
         assert_eq!(end_to_end.get_sample_sum(), 2.0 + 5.5);
+        // Each became contiguous when decided: finality times the same span.
+        let finality = metrics.checkpoint_finality_latency_s(FINALIZE);
+        assert_eq!(finality.get_sample_count(), 2);
+        assert_eq!(finality.get_sample_sum(), 2.0 + 4.0);
+        assert_eq!(metrics.checkpoint_pending_heights().get(), 0);
     }
 
     #[test]
@@ -954,6 +978,11 @@ mod tests {
         assert_eq!(certification.get_sample_sum(), 1.0);
         let committed = metrics.checkpoint_certification_latency_s(FINALIZE, SLOW);
         assert_eq!(committed.get_sample_count(), 0);
+        // It became contiguous on arrival as well, not at the commit.
+        let finality = metrics.checkpoint_finality_latency_s(FINALIZE);
+        assert_eq!(finality.get_sample_count(), 1);
+        assert_eq!(finality.get_sample_sum(), 1.0);
+        assert_eq!(metrics.end_to_end_latency_s().get_sample_sum(), 1.0);
     }
 
     #[test]

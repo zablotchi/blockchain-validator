@@ -386,6 +386,26 @@ fn assert_accounting_matches_histograms(
     }
 }
 
+/// Each validator's count of contiguously decided finalized checkpoints, as finality and end
+/// to end observed them, and its pending-heights gauge.
+fn contiguous(committee: &SimulatedTestbed) -> Vec<(u64, u64, i64)> {
+    committee
+        .validators()
+        .iter()
+        .map(|validator| {
+            let metrics = validator.metrics();
+            let finality = metrics.checkpoint_finality_latency_s(FINALIZE);
+            let end_to_end = metrics.end_to_end_latency_s();
+            let pending = metrics.checkpoint_pending_heights().get();
+            (
+                finality.get_sample_count(),
+                end_to_end.get_sample_count(),
+                pending,
+            )
+        })
+        .collect()
+}
+
 /// Each validator's count of finalized and skipped checkpoints.
 fn decisions(committee: &SimulatedTestbed) -> Vec<(u64, u64)> {
     committee
@@ -424,12 +444,19 @@ fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
             let mut committee = generate_load(fragmented(finality)).await;
             committee.wait_for_decided().await;
             let decisions = decisions(&committee);
-            // Skipped transactions are never finalized: only finalized heights close end to
-            // end.
-            for (validator, (finalized, _)) in committee.validators().iter().zip(&decisions) {
+            // Every height ends contiguous, but skipped transactions are never finalized: only
+            // finalized heights close end to end.
+            let contiguous = contiguous(&committee);
+            let validators = committee
+                .validators()
+                .iter()
+                .zip(&decisions)
+                .zip(contiguous);
+            for ((validator, &(finalized, skipped)), contiguous) in validators {
                 assert_accounting_matches_histograms(validator);
-                let end_to_end = validator.metrics().end_to_end_latency_s();
-                assert_eq!(end_to_end.get_sample_count(), *finalized, "{finality}");
+                assert_eq!(contiguous, (finalized, finalized, 0), "{finality}");
+                let skips = validator.metrics().checkpoint_finality_latency_s(SKIP);
+                assert_eq!(skips.get_sample_count(), skipped, "{finality}");
                 // C finalizes on the fast path here, and skips only by the commit sequence.
                 if finality == FinalityProtocol::C {
                     let [fast, _] = latencies(validator, FINALIZE);
@@ -470,11 +497,18 @@ fn baselines_stall_at_the_first_fragmented_height() {
         SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
             let committee = generate_load(fragmented(finality)).await;
             let decisions = decisions(&committee);
+            let contiguous = contiguous(&committee);
             let results = committee.shutdown().await;
 
             let log = agreed_decisions(results.iter().map(|(_, certifier)| certifier), finality);
-            for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
+            let validators = decisions.into_iter().zip(contiguous).zip(&results);
+            for (((finalized, skipped), contiguous), (_, certifier)) in validators {
                 assert_eq!(skipped, 0, "{finality}");
+                // Finality and end-to-end latency stop below the first fragmented height,
+                // while the pending heights keep growing.
+                let stalled = FORK_PERIOD - 1;
+                let pending = certifier.pending().len() as i64;
+                assert_eq!(contiguous, (stalled, stalled, pending), "{finality}");
                 // The watermark stops below the first fragmented height for good, and every
                 // height from there on stays pending, although the ones without a fork
                 // finalized.

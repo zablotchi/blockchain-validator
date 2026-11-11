@@ -173,6 +173,9 @@ pub struct CheckpointCertifier {
     early: BTreeMap<BlockReference, Vec<Arrival>>,
     /// Concluded certificates not yet taken for submission.
     certificates: Vec<Certificate>,
+    /// Decided checkpoints the watermark passed since the last take, in commit order, with
+    /// their mint timings.
+    contiguous: Vec<(Outcome, CheckpointTimings)>,
     /// Every decision by anchor, recorded when made, so that tests can compare decisions
     /// behind a gap the watermark never passes.
     #[cfg(any(test, feature = "decision-log"))]
@@ -191,6 +194,7 @@ impl CheckpointCertifier {
             watermark: None,
             early: BTreeMap::new(),
             certificates: Vec::new(),
+            contiguous: Vec::new(),
             #[cfg(any(test, feature = "decision-log"))]
             decision_log: BTreeMap::new(),
         }
@@ -246,7 +250,7 @@ impl CheckpointCertifier {
     }
 
     /// This validator's checkpoints not yet contiguously decided, in commit order.
-    pub fn pending(&self) -> impl Iterator<Item = &Checkpoint> {
+    pub fn pending(&self) -> impl ExactSizeIterator<Item = &Checkpoint> {
         self.pending.iter().map(|entry| &entry.local)
     }
 
@@ -397,6 +401,12 @@ impl CheckpointCertifier {
     /// through consensus.
     pub fn take_certificates(&mut self) -> Vec<Certificate> {
         std::mem::take(&mut self.certificates)
+    }
+
+    /// The outcomes and mint timings of the checkpoints that became contiguously decided since
+    /// the last call, in commit order: when a client can use them, since commitments chain.
+    pub fn take_contiguous(&mut self) -> impl Iterator<Item = (Outcome, CheckpointTimings)> + '_ {
+        self.contiguous.drain(..)
     }
 
     /// The highest checkpoint such that it and all earlier checkpoints are decided.
@@ -605,7 +615,10 @@ impl CheckpointCertifier {
             .front()
             .is_some_and(|entry| entry.decision.is_some())
         {
-            self.watermark = self.pending.pop_front().and_then(|entry| entry.decision);
+            let entry = self.pending.pop_front().expect("decided entry");
+            let decision = entry.decision.expect("decided entry");
+            self.contiguous.push((decision.outcome(), entry.timings));
+            self.watermark = Some(decision);
         }
     }
 
@@ -980,6 +993,41 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_become_contiguous_once_in_commit_order() {
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::A, vec![1; 4], 3, 0);
+        let timings = |n| CheckpointTimings {
+            minted_at: Duration::from_secs(n),
+            mean_timestamp_ms: n,
+        };
+        for n in 1..=2 {
+            certifier.push(vote(n).anchor(), vote(n).commitment(), timings(n));
+        }
+
+        // The second height finalizes first: nothing is contiguous yet.
+        for author in 0..2 {
+            certifier.record(block(author, 0), vote(2));
+        }
+        assert_eq!(certifier.highest_decided(), None);
+        assert_eq!(certifier.take_contiguous().count(), 0);
+
+        // Skipping the first makes both contiguous, in commit order, once: the watermark
+        // advances over skips.
+        for author in 0..3 {
+            certifier.record(block(author, 1), diverged(author as u8));
+        }
+        let decided = certifier.highest_decided().expect("decided checkpoint");
+        assert_eq!(finalized(decided), vote(2));
+        assert!(certifier.pending().next().is_none());
+        let finalize = Outcome::Finalize(vote(2).commitment());
+        assert_eq!(
+            certifier.take_contiguous().collect::<Vec<_>>(),
+            [(Outcome::Skip, timings(1)), (finalize, timings(2))]
+        );
+        assert_eq!(certifier.take_contiguous().count(), 0);
+    }
+
+    #[test]
     fn votes_below_the_watermark_are_ignored() {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 1);
@@ -1050,24 +1098,6 @@ mod tests {
         certifier.record(block(3, 3), vote(1));
         let decided = certifier.highest_decided().expect("decided checkpoint");
         assert_eq!(decided.outcome(), Outcome::Skip);
-    }
-
-    #[test]
-    fn the_watermark_advances_over_skips() {
-        let mut certifier =
-            CheckpointCertifier::new_for_test(FinalityProtocol::A, vec![1; 4], 3, 2);
-        for authority in 0..2 {
-            certifier.record(block(authority, 0), vote(2));
-        }
-        assert_eq!(certifier.highest_decided(), None);
-
-        // Skipping the first checkpoint makes the finalized second one contiguous.
-        for authority in 0..3 {
-            certifier.record(block(authority, 1), diverged(authority as u8));
-        }
-        let decided = certifier.highest_decided().expect("decided checkpoint");
-        assert_eq!(finalized(decided), vote(2));
-        assert!(certifier.pending().next().is_none());
     }
 
     #[test]
