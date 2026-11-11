@@ -146,8 +146,8 @@ struct PendingCheckpoint {
 struct Certification {
     /// The committed votes by carrying block: the only votes a committed certificate may cite.
     committed: BTreeMap<BlockReference, Digest>,
-    /// The committed valid certificates.
-    settling: Tally<Outcome>,
+    /// The committed valid skip certificates.
+    skips: Tally<()>,
     /// Under C, the votes counted on arrival by carrying block: the only votes an arriving
     /// certificate may cite.
     arrived: BTreeMap<BlockReference, Digest>,
@@ -326,9 +326,10 @@ impl CheckpointCertifier {
         Some(decided)
     }
 
-    /// Records the committed certificate carried by `block`, under certifying protocols: the
-    /// first valid certificate of each authority counts, and the first count that the
-    /// protocol [settles](FinalityProtocol::settles) decides. Returns like
+    /// Records the committed certificate carried by `block`, under certifying protocols: a
+    /// valid phase-one certificate decides at once, even if its author's skip certificate
+    /// committed first, and the first valid skip certificate of each authority counts until
+    /// they [settle](FinalityProtocol::settles_skip). Returns like
     /// [`record`](CheckpointCertifier::record).
     pub fn record_certificate(
         &mut self,
@@ -345,17 +346,23 @@ impl CheckpointCertifier {
         }
         let stake = self.committee.get_stake(block.authority)?;
         let outcome = certificate.outcome();
-        let certification = self.pending[index].certification.as_deref_mut()?;
-        let support = certification.settling.add(stake, outcome, block)?;
-        if !self.protocol.settles(self.thresholds, outcome, support) {
-            return None;
-        }
-        // A certificate deciding alone is proven by its votes; several (C's skips), by their
-        // blocks.
-        let mut proof = certification.settling.blocks(Some(outcome));
-        if proof.len() == 1 {
-            proof = certificate.votes().to_vec();
-        }
+        let proof = match outcome {
+            Outcome::Finalize(_) => certificate.votes().to_vec(),
+            Outcome::Skip => {
+                let certification = self.pending[index].certification.as_deref_mut()?;
+                let support = certification.skips.add(stake, (), block)?;
+                if !self.protocol.settles_skip(self.thresholds, support) {
+                    return None;
+                }
+                // A skip certificate deciding alone (B's) is proven by its votes; several
+                // (C's), by their blocks.
+                let mut proof = certification.skips.blocks(None);
+                if proof.len() == 1 {
+                    proof = certificate.votes().to_vec();
+                }
+                proof
+            }
+        };
         let decided = self.decide(index, outcome, proof);
         self.advance_watermark();
         Some(decided)
@@ -1149,6 +1156,9 @@ mod tests {
             certifier.record_certificate(carrier(0), &skip),
             Some((Outcome::Skip, CheckpointTimings::default()))
         );
+        // Deciding alone, it is proven by its votes.
+        let decided = certifier.highest_decided().expect("decided checkpoint");
+        assert_eq!(decided.proof(), skip.votes());
     }
 
     #[test]
@@ -1389,11 +1399,12 @@ mod tests {
         let phase_one = certificate(finalize, vec![block(0, 0), block(1, 0), block(2, 0)]);
         let skip = certificate(Outcome::Skip, vec![block(1, 0), block(2, 0), block(3, 0)]);
 
-        // Fewer than 2f+1 skip certificates commit first: the phase-one one still wins.
+        // Fewer than 2f+1 skip certificates commit first: the phase-one one still wins, even
+        // from an author whose skip certificate counted (a Byzantine one certifies both).
         assert_eq!(certifier.record_certificate(carrier(0), &skip), None);
         assert_eq!(certifier.record_certificate(carrier(1), &skip), None);
         assert_eq!(
-            certifier.record_certificate(carrier(2), &phase_one),
+            certifier.record_certificate(BlockReference::new_test(1, 201), &phase_one),
             Some((finalize, CheckpointTimings::default()))
         );
         let decided = certifier.highest_decided().expect("decided checkpoint");
@@ -1547,6 +1558,21 @@ mod tests {
             certifier
                 .record_arriving_certificate(carrier(2), heavy)
                 .is_some()
+        );
+
+        // Committed skip certificates weigh their carriers' stake too.
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::C, vec![2, 1, 1, 1], 4, 1);
+        certifier.record(block(0, 0), vote(1));
+        certifier.record(block(1, 0), diverged(1));
+        certifier.record(block(2, 0), diverged(2));
+        let skip = certificate(Outcome::Skip, vec![block(0, 0), block(1, 0), block(2, 0)]);
+        for author in [0, 1] {
+            assert_eq!(certifier.record_certificate(carrier(author), &skip), None);
+        }
+        assert_eq!(
+            certifier.record_certificate(carrier(2), &skip),
+            Some((Outcome::Skip, CheckpointTimings::default()))
         );
     }
 }

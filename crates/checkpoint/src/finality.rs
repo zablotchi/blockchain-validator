@@ -89,13 +89,13 @@ impl FinalityProtocol {
         }
     }
 
-    /// Whether committed valid certificates claiming `outcome`, from distinct authorities
-    /// totalling `support`, decide it.
-    pub(crate) fn settles(self, thresholds: Thresholds, outcome: Outcome, support: Stake) -> bool {
-        match (self, outcome) {
-            (Self::Baseline | Self::SuiBaseline | Self::A, _) => false,
-            (Self::B, _) | (Self::C, Outcome::Finalize(_)) => true,
-            (Self::C, Outcome::Skip) => support >= thresholds.quorum,
+    /// Whether committed valid skip certificates from distinct authorities, totalling
+    /// `support`, decide the skip. A committed valid phase-one certificate always decides.
+    pub(crate) fn settles_skip(self, thresholds: Thresholds, support: Stake) -> bool {
+        match self {
+            Self::Baseline | Self::SuiBaseline | Self::A => false,
+            Self::B => true,
+            Self::C => support >= thresholds.quorum,
         }
     }
 
