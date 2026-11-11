@@ -173,6 +173,10 @@ pub struct CheckpointCertifier {
     early: BTreeMap<BlockReference, Vec<Arrival>>,
     /// Concluded certificates not yet taken for submission.
     certificates: Vec<Certificate>,
+    /// Every decision by anchor, recorded when made, so that tests can compare decisions
+    /// behind a gap the watermark never passes.
+    #[cfg(any(test, feature = "decision-log"))]
+    decision_log: BTreeMap<BlockReference, Outcome>,
 }
 
 impl CheckpointCertifier {
@@ -187,6 +191,8 @@ impl CheckpointCertifier {
             watermark: None,
             early: BTreeMap::new(),
             certificates: Vec::new(),
+            #[cfg(any(test, feature = "decision-log"))]
+            decision_log: BTreeMap::new(),
         }
     }
 
@@ -391,6 +397,11 @@ impl CheckpointCertifier {
         self.watermark.as_ref()
     }
 
+    #[cfg(any(test, feature = "decision-log"))]
+    pub fn decision_log(&self) -> &BTreeMap<BlockReference, Outcome> {
+        &self.decision_log
+    }
+
     fn decided_round(&self) -> u64 {
         self.watermark
             .as_ref()
@@ -572,6 +583,11 @@ impl CheckpointCertifier {
         entry.tally = None;
         entry.certification = None;
         entry.decision = Some(Decision::new(anchor, outcome, proof));
+        #[cfg(any(test, feature = "decision-log"))]
+        {
+            let previous = self.decision_log.insert(anchor, outcome);
+            debug_assert!(previous.is_none(), "{anchor:?} decided twice");
+        }
         (outcome, entry.timings)
     }
 
@@ -928,6 +944,8 @@ mod tests {
         // The certificate formed — timings surrendered — although not yet contiguous.
         assert!(timings.is_some());
         assert_eq!(certifier.highest_decided(), None);
+        let finalize = |n| (vote(n).anchor(), Outcome::Finalize(vote(n).commitment()));
+        assert_eq!(certifier.decision_log().clone(), [finalize(2)].into());
 
         // Late votes for the certified-but-not-yet-contiguous checkpoint change nothing, even
         // a full quorum of them (as when votes are counted on arrival and again at commit).
@@ -941,6 +959,10 @@ mod tests {
         let certified = certifier.highest_decided().expect("certified checkpoint");
         assert_eq!(finalized(certified), vote(2));
         assert_eq!(certified.proof(), [block(0, 0), block(1, 0), block(2, 0)]);
+        assert_eq!(
+            certifier.decision_log().clone(),
+            [finalize(1), finalize(2)].into()
+        );
 
         // The watermark keeps advancing from where it stands.
         for authority in 0..3 {

@@ -5,7 +5,9 @@
 //! Unlike the smoke test, every validator submits through its own replica, so the total order
 //! of transactions is genuinely decided by consensus across concurrent proposers.
 
-use std::{num::NonZeroU64, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, fmt::Display, num::NonZeroU64, path::Path, sync::Arc, time::Duration,
+};
 
 use checkpoint::{certifier::CheckpointCertifier, checkpoint::Outcome, finality::FinalityProtocol};
 use dag::{authority::Authority, block::BlockReference, context::Ctx, metrics::Metrics};
@@ -170,6 +172,20 @@ type RunOutcome = (
     Vec<u64>,
 );
 
+/// The decisions by anchor, asserted identical across `certifiers`: unlike the watermark, they
+/// include the heights decided behind a gap.
+fn agreed_decisions<'a>(
+    certifiers: impl IntoIterator<Item = &'a CheckpointCertifier>,
+    context: impl Display,
+) -> BTreeMap<BlockReference, Outcome> {
+    let mut certifiers = certifiers.into_iter();
+    let reference = certifiers.next().expect("a validator").decision_log();
+    for certifier in certifiers {
+        assert_eq!(certifier.decision_log(), reference, "{context}");
+    }
+    reference.clone()
+}
+
 fn run_once(seed: u64) -> RunOutcome {
     SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
         let mut committee = SimulatedTestbed::start(ValidatorParameters::default()).await;
@@ -260,6 +276,7 @@ fn validators_converge_under_simulation() {
         assert_eq!(other.highest_decided(), Some(certified));
         assert!(other.pending().next().is_none());
     }
+    agreed_decisions(results.iter().map(|(_, certifier)| certifier), "seed 7");
     // Every validator's coupled object was created and modified at least once.
     for index in 0..COMMITTEE_SIZE {
         let latest = store
@@ -288,6 +305,11 @@ fn simulation_is_deterministic_per_seed() {
                 a_certifier.highest_decided(),
                 b_certifier.highest_decided(),
                 "seed {seed} produced diverging certificates"
+            );
+            assert_eq!(
+                a_certifier.decision_log(),
+                b_certifier.decision_log(),
+                "seed {seed} produced diverging decisions"
             );
         }
     }
@@ -389,15 +411,20 @@ fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
             }
             let results = committee.shutdown().await;
 
-            // Decisions follow the commit sequence, proofs included except under C.
+            // Decisions follow the commit sequence: every validator skips the fragmented
+            // heights and finalizes the rest, proofs included except under C.
+            let log = agreed_decisions(results.iter().map(|(_, certifier)| certifier), finality);
+            let minted = log.len() as u64;
+            assert!(
+                minted > FORK_PERIOD,
+                "the run must reach a fragmented height"
+            );
+            let skips = log.values().filter(|outcome| **outcome == Outcome::Skip);
+            let skips = skips.count() as u64;
+            assert_eq!(skips, minted / FORK_PERIOD, "{finality}");
             let (_, reference) = &results[0];
-            for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
-                let minted = finalized + skipped;
-                assert!(
-                    minted > FORK_PERIOD,
-                    "the run must reach a fragmented height"
-                );
-                assert_eq!(skipped, minted / FORK_PERIOD, "{finality}");
+            for (decided, (_, certifier)) in decisions.into_iter().zip(&results) {
+                assert_eq!(decided, (minted - skips, skips), "{finality}");
                 assert_eq!(
                     last_decision(finality, certifier),
                     last_decision(finality, reference),
@@ -416,6 +443,7 @@ fn baselines_stall_at_the_first_fragmented_height() {
             let decisions = decisions(&committee);
             let results = committee.shutdown().await;
 
+            let log = agreed_decisions(results.iter().map(|(_, certifier)| certifier), finality);
             for ((finalized, skipped), (_, certifier)) in decisions.into_iter().zip(&results) {
                 assert_eq!(skipped, 0, "{finality}");
                 // The watermark stops below the first fragmented height for good, and every
@@ -427,6 +455,13 @@ fn baselines_stall_at_the_first_fragmented_height() {
                     "the run must pass a fragmented height"
                 );
                 assert_eq!(finalized, minted - minted / FORK_PERIOD, "{finality}");
+                assert_eq!(finalized, log.len() as u64, "{finality}");
+                let pending = (FORK_PERIOD..).zip(certifier.pending());
+                for (height, checkpoint) in pending {
+                    let decided = log.contains_key(&checkpoint.anchor());
+                    let fragmented = height % FORK_PERIOD == 0;
+                    assert_eq!(decided, !fragmented, "{finality} at height {height}");
+                }
             }
         });
     }
@@ -462,6 +497,7 @@ fn certification_latencies(finality: FinalityProtocol) -> Vec<f64> {
         for (_, certifier) in &results {
             assert_eq!(decided(certifier), decided(reference), "{finality}");
         }
+        agreed_decisions(results.iter().map(|(_, certifier)| certifier), finality);
         latencies
     })
 }
@@ -511,10 +547,15 @@ fn protocol_c_skips_wait_out_the_phase_one_timeout_deterministically() {
                 })
                 .collect();
             let results = committee.shutdown().await;
-            (skips, results.into_iter().map(|(_, certifier)| certifier))
+            let certifiers: Vec<_> = results
+                .into_iter()
+                .map(|(_, certifier)| certifier)
+                .collect();
+            let decisions = agreed_decisions(&certifiers, FinalityProtocol::C);
+            (skips, certifiers, decisions)
         })
     };
-    let (first_skips, first) = run();
+    let (first_skips, first, first_decisions) = run();
     // Other validators' timeouts start at their own mints, so a skip can decide a little under
     // one timeout after this validator's; committing the certificates more than makes up for
     // it on average.
@@ -526,9 +567,10 @@ fn protocol_c_skips_wait_out_the_phase_one_timeout_deterministically() {
             "skips took {mean} s on average"
         );
     }
-    let (second_skips, second) = run();
+    let (second_skips, second, second_decisions) = run();
     assert_eq!(first_skips, second_skips);
-    for (a, b) in first.zip(second) {
+    assert_eq!(first_decisions, second_decisions);
+    for (a, b) in first.iter().zip(&second) {
         assert_eq!(a.highest_decided(), b.highest_decided());
     }
 }

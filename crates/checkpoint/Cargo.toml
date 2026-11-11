@@ -13,6 +13,9 @@ tracing.workspace = true
 
 [features]
 test-utils = ["dag/test-utils", "execution/test-utils"]
+# Records every decision for tests to compare. Not in `test-utils`, which the certifier bench
+# turns on: the bench measures the certifier without it.
+decision-log = []
 
 [dev-dependencies]
 # Self-dependency turning on the gated test constructors for the bench targets.

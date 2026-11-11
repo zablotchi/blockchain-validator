@@ -23,7 +23,7 @@ tracing.workspace = true
 benchmark = ["dep:rand", "execution/test-utils"]
 
 [dev-dependencies]
-checkpoint = { workspace = true, features = ["test-utils"] }
+checkpoint = { workspace = true, features = ["decision-log", "test-utils"] }
 execution = { workspace = true, features = ["test-utils"] }
 futures.workspace = true
 rand.workspace = true

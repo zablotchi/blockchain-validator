@@ -17,8 +17,17 @@ const COMMITTEE_SIZE: usize = 4;
 /// Quorum for [`COMMITTEE_SIZE`] unit-stake validators: 2f + 1.
 const QUORUM: u64 = 3;
 
+/// Fails a bench built with the decision log, which workspace-wide builds turn on (through
+/// `validator`'s dev-dependencies): run `cargo bench -p checkpoint`.
+fn assert_measures_without_the_decision_log() {
+    if cfg!(feature = "decision-log") {
+        panic!("built with the decision log: run `cargo bench -p checkpoint`");
+    }
+}
+
 /// Mints [`CHECKPOINTS`] checkpoints into a fresh certifier.
 fn mint(c: &mut Criterion) {
+    assert_measures_without_the_decision_log();
     let mut group = c.benchmark_group("certifier");
     group.throughput(Throughput::Elements(CHECKPOINTS));
     group.bench_function("mint", |b| {
@@ -47,6 +56,7 @@ fn mint(c: &mut Criterion) {
 /// Records a quorum of votes for each of [`CHECKPOINTS`] pending checkpoints, in commit order,
 /// driving the full path: accumulate stake, certify, advance the watermark, prune the window.
 fn certify(c: &mut Criterion) {
+    assert_measures_without_the_decision_log();
     let mut group = c.benchmark_group("certifier");
     group.throughput(Throughput::Elements(CHECKPOINTS * QUORUM));
     group.bench_function("certify", |b| {
