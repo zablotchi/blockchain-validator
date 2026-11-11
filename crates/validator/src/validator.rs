@@ -23,7 +23,7 @@ use dag::{
 use execution::{
     engine::ExecutionEngine, scheduler::SequentialScheduler, transaction::Transaction,
 };
-use prometheus::Registry;
+use prometheus::{Registry, local::LocalHistogram};
 use replica::{
     builder::{ReplicaBuilder, StorageKind},
     config::{PrivateReplicaConfig, PublicReplicaConfig},
@@ -209,6 +209,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let (decided_sender, decided) = watch::channel(state.decided_everything());
         let driver_metrics = metrics.clone();
         let driver = C::spawn(async move {
+            let client_latency = driver_metrics.client_commit_latency_s().local();
             let times_out = state.certifier.protocol().times_out();
             // Re-attest checkpoints undecided at replay: votes in flight at shutdown died
             // with the transaction queue, and a validator otherwise attests only once, so an
@@ -280,7 +281,8 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                         // The clock starts at delivery (idle waiting is not latency) and stops
                         // after execution, checkpoint minting, and vote recording.
                         let start = C::now();
-                        let (executed, minted) = state.execute_subdag(&driver_metrics, now, subdag);
+                        let (executed, minted) =
+                            state.execute_subdag(&driver_metrics, &client_latency, now, subdag);
                         driver_metrics.observe_subdag_execution_latency(C::elapsed(&start));
                         count += executed as u64;
                         let _ = executed_sender.send(count);
@@ -335,6 +337,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         // Isolated metrics, discarded with these handles: replay records nothing.
         let metrics = Metrics::new_for_test(committee.len());
         let replay_metrics = ValidatorMetrics::new(&Registry::new());
+        let replay_latency = replay_metrics.client_commit_latency_s().local();
         let (storage, _recovered) = Storage::open(self.authority, wal, metrics, &committee)?;
 
         let mut replayed = 0;
@@ -350,9 +353,9 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 .collect::<eyre::Result<_>>()?;
             let subdag = CommittedSubDag::new(commit.leader, blocks);
             // The minted checkpoint is dropped: replay never submits votes.
-            let (executed, _) = self
-                .state
-                .execute_subdag(&replay_metrics, Duration::ZERO, subdag);
+            let (executed, _) =
+                self.state
+                    .execute_subdag(&replay_metrics, &replay_latency, Duration::ZERO, subdag);
             replayed += executed as u64;
         }
         Ok(replayed)
@@ -371,10 +374,13 @@ impl<E: ExecutionEngine> ExecutionState<E> {
     /// payloads are skipped; the choice is deterministic. Sub-dags that execute nothing are not
     /// checkpointed: their commitment is unchanged, and their count varies across validators
     /// at any executed-transaction cut. `now` stamps the mint and closes the latency metrics
-    /// of checkpoints decided by the mint or this sub-dag's votes and certificates.
+    /// of checkpoints decided by the mint or this sub-dag's votes and certificates, and of
+    /// every client transaction in `client_latency`, a local copy of `metrics`' histogram (so
+    /// per-transaction observations stay off the shared one), flushed once per sub-dag.
     fn execute_subdag(
         &mut self,
         metrics: &ValidatorMetrics,
+        client_latency: &LocalHistogram,
         now: Duration,
         mut subdag: CommittedSubDag,
     ) -> (usize, Option<Checkpoint>) {
@@ -402,6 +408,8 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 match envelope.into_payload() {
                     Payload::Execute(transaction) => {
                         stamp_sum_ms += stamp_ms;
+                        let submitted = Duration::from_millis(stamp_ms);
+                        client_latency.observe(now.saturating_sub(submitted).as_secs_f64());
                         Some(transaction)
                     }
                     Payload::Attest(vote) => {
@@ -415,6 +423,8 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 }
             });
         let executed = self.scheduler.execute(transactions).len();
+        metrics.inc_executed_transactions(executed as u64);
+        client_latency.flush();
         let minted = (executed > 0).then(|| {
             self.minted += 1;
             let timings = CheckpointTimings {
@@ -620,6 +630,19 @@ mod tests {
         validator::{ExecutionState, ValidatorBuilder},
     };
 
+    impl ExecutionState<FakeExecutor> {
+        /// [`execute_subdag`](ExecutionState::execute_subdag) with a local histogram of its own.
+        fn execute(
+            &mut self,
+            metrics: &ValidatorMetrics,
+            now: Duration,
+            subdag: CommittedSubDag,
+        ) -> (usize, Option<Checkpoint>) {
+            let client_latency = metrics.client_commit_latency_s().local();
+            self.execute_subdag(metrics, &client_latency, now, subdag)
+        }
+    }
+
     fn state(protocol: FinalityProtocol) -> ExecutionState<FakeExecutor> {
         ExecutionState {
             scheduler: SequentialScheduler::new(FakeExecutor),
@@ -694,7 +717,7 @@ mod tests {
         let transaction = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
         let valid = Envelope::new(0, Payload::Execute(transaction.into())).to_bytes();
 
-        let (executed, minted) = state.execute_subdag(
+        let (executed, minted) = state.execute(
             &metrics(),
             Duration::ZERO,
             subdag(vec![vec![0xFF; 16], valid]),
@@ -706,11 +729,40 @@ mod tests {
     }
 
     #[test]
+    fn client_metrics_count_client_transactions_only() {
+        let mut state = state(FinalityProtocol::Baseline);
+        let metrics = metrics();
+        let execute = |id, stamp_ms| {
+            let create = FakeTransaction::success(vec![], vec![ObjectId::new(id)], vec![]);
+            Envelope::new(stamp_ms, Payload::Execute(create.into())).to_bytes()
+        };
+        let vote = Envelope::new(500, Payload::Attest(Checkpoint::new_for_test(1))).to_bytes();
+        // The last one is stamped by a submitter whose clock runs ahead of ours.
+        let payloads = vec![
+            execute(1, 1_000),
+            vote,
+            vec![0xFF; 16],
+            execute(2, 2_000),
+            execute(3, 4_000),
+        ];
+
+        let (executed, _) = state.execute(&metrics, Duration::from_secs(3), subdag(payloads));
+
+        // Votes and undecodable payloads are neither counted nor timed, and a stamp from the
+        // future times zero.
+        assert_eq!(executed, 3);
+        assert_eq!(metrics.executed_transactions().get(), 3);
+        let latency = metrics.client_commit_latency_s();
+        assert_eq!(latency.get_sample_count(), 3);
+        assert_eq!(latency.get_sample_sum(), 2.0 + 1.0 + 0.0);
+    }
+
+    #[test]
     fn subdags_with_only_undecodable_payloads_mint_no_checkpoint() {
         let mut state = state(FinalityProtocol::Baseline);
 
         let (executed, minted) =
-            state.execute_subdag(&metrics(), Duration::ZERO, subdag(vec![vec![0xFF; 16]]));
+            state.execute(&metrics(), Duration::ZERO, subdag(vec![vec![0xFF; 16]]));
 
         assert_eq!(executed, 0);
         assert!(minted.is_none());
@@ -728,12 +780,11 @@ mod tests {
         let mut diverged = Vec::new();
         for round in 1..=3 {
             // Sub-dags executing nothing mint nothing, so they do not count as heights.
-            state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![vec![0xFF; 16]]));
+            state.execute(&metrics, Duration::ZERO, subdag(vec![vec![0xFF; 16]]));
             let create = FakeTransaction::success(vec![], vec![ObjectId::new(round)], vec![]);
             let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
             let blocks = vec![(0, vec![execute])];
-            let (_, minted) =
-                state.execute_subdag(&metrics, Duration::ZERO, subdag_at(round, blocks));
+            let (_, minted) = state.execute(&metrics, Duration::ZERO, subdag_at(round, blocks));
             let minted = minted.expect("executing sub-dag must mint a checkpoint");
             diverged.push(minted.commitment() != state.scheduler.store().commitment());
         }
@@ -785,7 +836,7 @@ mod tests {
                 Envelope::new(stamp_ms, Payload::Execute(transaction.into())).to_bytes()
             })
             .collect();
-        let (_, minted) = state.execute_subdag(&metrics, Duration::from_secs(1), subdag(executes));
+        let (_, minted) = state.execute(&metrics, Duration::from_secs(1), subdag(executes));
         let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
         // A quorum of votes delivered in a later sub-dag, one block per author.
@@ -801,7 +852,7 @@ mod tests {
             .iter()
             .map(|block| *block.reference())
             .collect();
-        let (executed, minted) = state.execute_subdag(&metrics, Duration::from_secs(4), delivering);
+        let (executed, minted) = state.execute(&metrics, Duration::from_secs(4), delivering);
 
         assert_eq!(executed, 0);
         assert!(minted.is_none());
@@ -829,7 +880,7 @@ mod tests {
         let metrics = metrics();
         let create = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
         let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
-        let (_, minted) = state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![execute]));
+        let (_, minted) = state.execute(&metrics, Duration::ZERO, subdag(vec![execute]));
         let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
         // Votes for the first checkpoint share the sub-dag with a fresh transaction; the vote
@@ -843,7 +894,7 @@ mod tests {
             (2, vec![vote()]),
         ];
         let (executed, minted) =
-            state.execute_subdag(&metrics, Duration::from_secs(2), subdag_at(2, blocks));
+            state.execute(&metrics, Duration::from_secs(2), subdag_at(2, blocks));
 
         assert_eq!(executed, 1);
         let second = minted.expect("the update must mint a second checkpoint");
@@ -863,7 +914,7 @@ mod tests {
                 (author, vec![vote])
             })
             .collect();
-        state.execute_subdag(&metrics, Duration::from_secs(6), subdag_at(3, votes));
+        state.execute(&metrics, Duration::from_secs(6), subdag_at(3, votes));
         let certification = metrics.checkpoint_certification_latency_s(FINALIZE, SLOW);
         assert_eq!(certification.get_sample_count(), 2);
         assert_eq!(certification.get_sample_sum(), 2.0 + 4.0);
@@ -876,7 +927,7 @@ mod tests {
     fn the_sui_baseline_finalizes_on_arrival_ahead_of_the_commit() {
         let mut state = state(FinalityProtocol::SuiBaseline);
         let metrics = metrics();
-        let (_, minted) = state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
+        let (_, minted) = state.execute(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
         let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
         // Votes share blocks with other payloads: the scan reads past them.
@@ -897,7 +948,7 @@ mod tests {
         // The same votes committing later decide nothing again.
         let anchor = *votes[0].reference();
         let delivering = CommittedSubDag::new(anchor, votes);
-        state.execute_subdag(&metrics, Duration::from_secs(5), delivering);
+        state.execute(&metrics, Duration::from_secs(5), delivering);
         let certification = metrics.checkpoint_certification_latency_s(FINALIZE, FAST);
         assert_eq!(certification.get_sample_count(), 1);
         assert_eq!(certification.get_sample_sum(), 1.0);
@@ -910,12 +961,12 @@ mod tests {
         // Replay and blocks recovered on restart are never streamed as arrivals.
         let mut state = state(FinalityProtocol::SuiBaseline);
         let metrics = metrics();
-        let (_, minted) = state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
+        let (_, minted) = state.execute(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
         let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
         let votes = quorum_of_votes(2, &checkpoint);
         let delivering = CommittedSubDag::new(*votes[0].reference(), votes);
-        state.execute_subdag(&metrics, Duration::ZERO, delivering);
+        state.execute(&metrics, Duration::ZERO, delivering);
         let certified = state
             .certifier
             .highest_decided()
@@ -930,8 +981,7 @@ mod tests {
         for protocol in [FinalityProtocol::Baseline, FinalityProtocol::A] {
             let mut state = state(protocol);
             let metrics = metrics();
-            let (_, minted) =
-                state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
+            let (_, minted) = state.execute(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
             let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
             for block in quorum_of_votes(2, &checkpoint) {
@@ -945,8 +995,7 @@ mod tests {
     fn votes_arriving_before_the_mint_decide_it_on_minting() {
         // A twin validator ahead of this one mints the checkpoint it will vote for.
         let mut ahead = state(FinalityProtocol::SuiBaseline);
-        let (_, minted) =
-            ahead.execute_subdag(&metrics(), Duration::ZERO, subdag(vec![creation(1)]));
+        let (_, minted) = ahead.execute(&metrics(), Duration::ZERO, subdag(vec![creation(1)]));
         let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
         let mut state = state(FinalityProtocol::SuiBaseline);
@@ -955,7 +1004,7 @@ mod tests {
             assert!(!state.count_arrivals(&metrics, Duration::ZERO, &block));
         }
         let (_, minted) =
-            state.execute_subdag(&metrics, Duration::from_secs(3), subdag(vec![creation(1)]));
+            state.execute(&metrics, Duration::from_secs(3), subdag(vec![creation(1)]));
         assert_eq!(minted, Some(checkpoint.clone()));
 
         // Decided at the mint by arrivals, so certification took no time.
@@ -974,7 +1023,7 @@ mod tests {
     fn protocol_b_decides_when_a_concluded_certificate_commits() {
         let mut state = state(FinalityProtocol::B);
         let metrics = metrics();
-        let (_, minted) = state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
+        let (_, minted) = state.execute(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
         let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
         // f+1 arrivals conclude a certificate to submit, but decide nothing.
@@ -990,7 +1039,7 @@ mod tests {
         let certify = Envelope::new(0, Payload::Certify(certificates[0].clone())).to_bytes();
         let blocks = [vec![block(3, 2, vec![certify])], votes].concat();
         let delivering = CommittedSubDag::new(*blocks[0].reference(), blocks);
-        state.execute_subdag(&metrics, Duration::from_secs(3), delivering);
+        state.execute(&metrics, Duration::from_secs(3), delivering);
         let certified = state
             .certifier
             .highest_decided()
@@ -1005,7 +1054,7 @@ mod tests {
     fn protocol_c_finalizes_on_arriving_phase_one_certificates() {
         let mut state = state(FinalityProtocol::C);
         let metrics = metrics();
-        let (_, minted) = state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
+        let (_, minted) = state.execute(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
         let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
         // 2f+1 matching arrivals conclude a phase-one certificate, but decide nothing.
@@ -1043,14 +1092,13 @@ mod tests {
                 groups: vec![vec![Authority::new(1)], vec![Authority::new(2)]],
                 period: NonZeroU64::MIN,
             });
-            let (_, minted) =
-                twin.execute_subdag(&metrics(), Duration::ZERO, subdag(vec![creation(1)]));
+            let (_, minted) = twin.execute(&metrics(), Duration::ZERO, subdag(vec![creation(1)]));
             minted.expect("executing sub-dag must mint a checkpoint")
         };
         let checkpoints = [0, 1, 2].map(minted_by);
         let mut state = state(FinalityProtocol::C);
         let metrics = metrics();
-        state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
+        state.execute(&metrics, Duration::ZERO, subdag(vec![creation(1)]));
 
         // Three voted without 2f+1 matching: the timeout concludes a skip certificate.
         let votes: Vec<_> = (0..3)
@@ -1072,7 +1120,7 @@ mod tests {
         let certifying = (0..3).map(|author| block(author, 3, vec![certify.clone()]));
         let blocks: Vec<_> = votes.into_iter().chain(certifying).collect();
         let delivering = CommittedSubDag::new(*blocks[0].reference(), blocks);
-        state.execute_subdag(&metrics, Duration::from_secs(4), delivering);
+        state.execute(&metrics, Duration::from_secs(4), delivering);
         let decided = state
             .certifier
             .highest_decided()

@@ -105,10 +105,22 @@
                         "uid": "Fixed-UID-testbed"
                     },
                     "editorMode": "code",
-                    "expr": "rate(latency_s_count[1m])",
+                    "expr": "rate(validator_executed_transactions[1m])",
                     "instant": false,
                     "range": true,
                     "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "Fixed-UID-testbed"
+                    },
+                    "editorMode": "code",
+                    "expr": "avg(rate(latency_s_count[1m]))",
+                    "instant": false,
+                    "range": true,
+                    "refId": "B",
+                    "legendFormat": "Mysticeti payloads/s, incl. protocol messages (avg)"
                 }
             ],
             "title": "TPS (per node)",
@@ -224,7 +236,7 @@
                         "uid": "Fixed-UID-testbed"
                     },
                     "editorMode": "code",
-                    "expr": "histogram_quantile(0.5, sum by (le) (rate(latency_s_bucket[1m]))) * 1000",
+                    "expr": "histogram_quantile(0.5, sum by (le) (rate(client_commit_latency_s_bucket[1m]))) * 1000",
                     "hide": false,
                     "legendFormat": "Commit p50",
                     "range": true,
@@ -236,11 +248,35 @@
                         "uid": "Fixed-UID-testbed"
                     },
                     "editorMode": "code",
-                    "expr": "histogram_quantile(0.9, sum by (le) (rate(latency_s_bucket[1m]))) * 1000",
+                    "expr": "histogram_quantile(0.9, sum by (le) (rate(client_commit_latency_s_bucket[1m]))) * 1000",
                     "hide": false,
                     "legendFormat": "Commit p90",
                     "range": true,
                     "refId": "H"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "Fixed-UID-testbed"
+                    },
+                    "editorMode": "code",
+                    "expr": "histogram_quantile(0.5, sum by (le) (rate(latency_s_bucket[1m]))) * 1000",
+                    "hide": false,
+                    "legendFormat": "Mysticeti commit p50, incl. protocol messages",
+                    "range": true,
+                    "refId": "I"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "Fixed-UID-testbed"
+                    },
+                    "editorMode": "code",
+                    "expr": "histogram_quantile(0.9, sum by (le) (rate(latency_s_bucket[1m]))) * 1000",
+                    "hide": false,
+                    "legendFormat": "Mysticeti commit p90, incl. protocol messages",
+                    "range": true,
+                    "refId": "J"
                 }
             ],
             "title": "Consensus latency (ms)",
@@ -452,7 +488,7 @@
                         "uid": "Fixed-UID-testbed"
                     },
                     "editorMode": "code",
-                    "expr": "histogram_quantile(0.5, sum by (le) (rate(latency_s_bucket[1m]))) * 1000",
+                    "expr": "histogram_quantile(0.5, sum by (le) (rate(client_commit_latency_s_bucket[1m]))) * 1000",
                     "hide": false,
                     "legendFormat": "Commit",
                     "range": true,
@@ -848,14 +884,14 @@
                         "uid": "Fixed-UID-testbed"
                     },
                     "editorMode": "code",
-                    "expr": "sum(rate(end_to_end_latency_s_count[1m]))",
+                    "expr": "avg(rate(validator_executed_transactions[1m]))",
                     "hide": false,
-                    "legendFormat": "Total certified tx/s",
+                    "legendFormat": "Executed tx/s (per node, avg)",
                     "range": true,
                     "refId": "X"
                 }
             ],
-            "title": "Submitted vs certified transactions",
+            "title": "Submitted vs executed transactions",
             "type": "timeseries"
         },
         {

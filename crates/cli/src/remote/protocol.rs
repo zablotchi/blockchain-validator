@@ -284,6 +284,22 @@ impl ProtocolMetrics for ValidatorProtocol {
                 name: validator::metrics::SUBMITTED_TRANSACTIONS.into(),
                 kind: MetricKind::Counter,
             },
+            MetricSpec {
+                name: validator::metrics::EXECUTED_TRANSACTIONS.into(),
+                kind: MetricKind::Counter,
+            },
+            MetricSpec {
+                name: validator::metrics::CLIENT_COMMIT_LATENCY_S.into(),
+                kind: MetricKind::Histogram,
+            },
+            MetricSpec {
+                name: format!("{}_count", validator::metrics::CLIENT_COMMIT_LATENCY_S),
+                kind: MetricKind::Counter,
+            },
+            MetricSpec {
+                name: format!("{}_sum", validator::metrics::CLIENT_COMMIT_LATENCY_S),
+                kind: MetricKind::Counter,
+            },
         ]
     }
 

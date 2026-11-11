@@ -12,9 +12,13 @@ use prometheus::{
     register_histogram_with_registry, register_int_counter_with_registry,
 };
 
-// Metric names, public for scrapers. The counter is prefixed because the replica already
+// Metric names, public for scrapers. The counters are prefixed because the replica already
 // registers a `submitted_transactions` in the same registry.
 pub const SUBMITTED_TRANSACTIONS: &str = "validator_submitted_transactions";
+pub const EXECUTED_TRANSACTIONS: &str = "validator_executed_transactions";
+/// Unlike mysticeti's `latency_s`, which observes every committed payload, votes and
+/// certificates included.
+pub const CLIENT_COMMIT_LATENCY_S: &str = "client_commit_latency_s";
 pub const SUBDAG_EXECUTION_LATENCY_S: &str = "subdag_execution_latency_s";
 pub const CHECKPOINT_CERTIFICATION_LATENCY_S: &str = "checkpoint_certification_latency_s";
 pub const END_TO_END_LATENCY_S: &str = "end_to_end_latency_s";
@@ -39,6 +43,8 @@ const LATENCY_SEC_BUCKETS: &[f64] = &[
 
 pub struct ValidatorMetrics {
     submitted_transactions: IntCounter,
+    executed_transactions: IntCounter,
+    client_commit_latency_s: Histogram,
     subdag_execution_latency_s: Histogram,
     checkpoint_certification_latency_s: HistogramVec,
     end_to_end_latency_s: Histogram,
@@ -50,6 +56,19 @@ impl ValidatorMetrics {
             submitted_transactions: register_int_counter_with_registry!(
                 SUBMITTED_TRANSACTIONS,
                 "Transactions submitted by the load generator",
+                registry,
+            )
+            .unwrap(),
+            executed_transactions: register_int_counter_with_registry!(
+                EXECUTED_TRANSACTIONS,
+                "Client transactions executed",
+                registry,
+            )
+            .unwrap(),
+            client_commit_latency_s: register_histogram_with_registry!(
+                CLIENT_COMMIT_LATENCY_S,
+                "Client transaction submission to commit delivery latency (s)",
+                LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
             )
             .unwrap(),
@@ -84,6 +103,10 @@ impl ValidatorMetrics {
         self.submitted_transactions.inc_by(count);
     }
 
+    pub(crate) fn inc_executed_transactions(&self, count: u64) {
+        self.executed_transactions.inc_by(count);
+    }
+
     pub(crate) fn observe_subdag_execution_latency(&self, latency: Duration) {
         self.subdag_execution_latency_s
             .observe(latency.as_secs_f64());
@@ -115,6 +138,14 @@ impl ValidatorMetrics {
     /// The raw metrics, for test assertions (`get`/`get_sample_count`/`get_sample_sum`).
     pub fn submitted_transactions(&self) -> &IntCounter {
         &self.submitted_transactions
+    }
+
+    pub fn executed_transactions(&self) -> &IntCounter {
+        &self.executed_transactions
+    }
+
+    pub fn client_commit_latency_s(&self) -> &Histogram {
+        &self.client_commit_latency_s
     }
 
     pub fn subdag_execution_latency_s(&self) -> &Histogram {

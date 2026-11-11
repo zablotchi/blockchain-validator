@@ -237,12 +237,16 @@ impl RemoteBenchmarkDriver {
                     results,
                     stats,
                 } => {
-                    // `latency_s_count` scrapes as a rate: observations (transactions) per
-                    // second. Latencies are reported in seconds.
+                    // Counters scrape as rates: the executed counter gives client transactions
+                    // per second (mysticeti's `latency_s_count` would include votes and
+                    // certificates). Latencies are reported in seconds.
+                    let executed = validator::metrics::EXECUTED_TRANSACTIONS;
+                    let client_commit_p50 =
+                        format!("{}.p50", validator::metrics::CLIENT_COMMIT_LATENCY_S);
                     tracing::info!(
                         elapsed = elapsed.as_secs(),
-                        tps = stats.get("latency_s_count").map(|v| v.round()),
-                        commit_p50_s = stats.get("latency_s.p50"),
+                        tps = stats.get(executed).map(|v| v.round()),
+                        commit_p50_s = stats.get(&client_commit_p50),
                         e2e_p50_s = stats.get("end_to_end_latency_s.p50"),
                         "Benchmark tick"
                     );

@@ -217,6 +217,11 @@ fn run_once(seed: u64) -> RunOutcome {
             let histogram = validator.metrics().subdag_execution_latency_s();
             assert!(histogram.get_sample_count() > 0);
             delivered.push(histogram.get_sample_count());
+            // Client metrics count exactly the executed transactions, not the votes.
+            let executed = validator.executed();
+            assert_eq!(validator.metrics().executed_transactions().get(), executed);
+            let client_commit = validator.metrics().client_commit_latency_s();
+            assert_eq!(client_commit.get_sample_count(), executed);
 
             // Certification and end-to-end latencies derive from simulated clocks, so their
             // magnitudes are meaningful; each certified checkpoint observes both once.
@@ -229,7 +234,12 @@ fn run_once(seed: u64) -> RunOutcome {
                 end_to_end.get_sample_count(),
                 certification.get_sample_count()
             );
-            for (name, histogram) in [("certification", &certification), ("e2e", end_to_end)] {
+            let latencies = [
+                ("certification", &certification),
+                ("e2e", end_to_end),
+                ("client commit", client_commit),
+            ];
+            for (name, histogram) in latencies {
                 let mean = histogram.get_sample_sum() / histogram.get_sample_count() as f64;
                 assert!(
                     mean > 0.0 && mean < 10.0,
