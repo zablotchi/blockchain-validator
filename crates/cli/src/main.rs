@@ -10,6 +10,7 @@ use crate::args::{Args, Command};
 
 mod args;
 mod commands;
+mod config;
 mod remote;
 mod tracing;
 

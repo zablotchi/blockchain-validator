@@ -15,14 +15,17 @@ use eyre::{Context, Result};
 use orchestrator::{
     benchmark::{BenchmarkParameters, Parameters},
     orchestrator::Orchestrator,
-    protocol::{ProtocolCommands, ProtocolMetrics, ProtocolParameters},
+    protocol::{ProtocolCommands, ProtocolMetrics},
     provider::Instance,
     report::{MonitoringReport, TickReport},
     session::BenchmarkSession,
     settings::Settings,
 };
 
-use crate::remote::protocol::{ClientParameters, NodeParameters, ValidatorProtocol};
+use crate::{
+    config,
+    remote::protocol::{ClientParameters, NodeParameters, ValidatorProtocol},
+};
 
 pub(crate) struct RemoteBenchmarkDriver {
     settings: Settings,
@@ -45,15 +48,11 @@ impl RemoteBenchmarkDriver {
     ) -> Result<()> {
         let protocol_commands = ValidatorProtocol::new(&self.settings);
         let node_parameters = match &self.settings.node_parameters_path {
-            Some(path) => {
-                NodeParameters::load(path).wrap_err("Failed to load node's parameters")?
-            }
+            Some(path) => config::load(path).wrap_err("Failed to load node's parameters")?,
             None => NodeParameters::default(),
         };
         let client_parameters = match &self.settings.client_parameters_path {
-            Some(path) => {
-                ClientParameters::load(path).wrap_err("Failed to load client's parameters")?
-            }
+            Some(path) => config::load(path).wrap_err("Failed to load client's parameters")?,
             None => ClientParameters::default(),
         };
 

@@ -1,0 +1,4 @@
+disallowed-methods = [
+  { path = "dag::config::ImportExport::load", reason = "use crate::config::load, which rejects unknown keys" },
+  { path = "orchestrator::protocol::ProtocolParameters::load", reason = "use crate::config::load, which rejects unknown keys" },
+]

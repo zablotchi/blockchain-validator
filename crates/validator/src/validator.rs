@@ -3,7 +3,12 @@
 
 //! The validator node: a mysticeti replica wired to an execution engine.
 
-use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use checkpoint::{
     certifier::{CheckpointCertifier, CheckpointTimings},
@@ -139,6 +144,24 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             !finality.needs_bft_quorum() || quorum == 2 * committee.total_stake() / 3 + 1,
             "finality protocol {finality} needs a 2f+1 consensus quorum (no hybrid protocols)"
         );
+        if let Some(fork) = &fork {
+            let mut members = HashSet::new();
+            for group in &fork.groups {
+                eyre::ensure!(!group.is_empty(), "fork groups must not be empty");
+                for &authority in group {
+                    eyre::ensure!(
+                        committee.known_authority(authority),
+                        "fork group member {} is not in the committee",
+                        authority.index()
+                    );
+                    eyre::ensure!(
+                        members.insert(authority),
+                        "authority {} appears in the fork groups twice",
+                        authority.index()
+                    );
+                }
+            }
+        }
         let certifier = CheckpointCertifier::new(committee, finality, quorum);
         Ok(Validator {
             state: ExecutionState {
@@ -838,6 +861,44 @@ mod tests {
         assert!(build(FinalityProtocol::C).is_err());
         assert!(build(FinalityProtocol::Baseline).is_ok());
         assert!(build(FinalityProtocol::SuiBaseline).is_ok());
+    }
+
+    #[test]
+    fn fork_groups_must_be_disjoint_non_empty_sets_of_committee_members() {
+        let build = |groups: &[&[usize]]| {
+            let fork = ForkInjection {
+                groups: groups
+                    .iter()
+                    .map(|group| group.iter().copied().map(Authority::from).collect())
+                    .collect(),
+                period: NonZeroU64::new(5).unwrap(),
+            };
+            let private_config =
+                PrivateReplicaConfig::new_for_benchmarks(Path::new("unused"), 4).remove(0);
+            ValidatorBuilder::new(
+                FakeExecutor,
+                Authority::new(0),
+                PublicReplicaConfig::new_for_tests(4),
+                private_config,
+            )
+            .with_parameters(ValidatorParameters {
+                fork: Some(fork),
+                ..Default::default()
+            })
+            .build()
+        };
+        let fails_with =
+            |groups, message| build(groups).is_err_and(|error| error.to_string().contains(message));
+        assert!(build(&[&[1], &[2, 3]]).is_ok());
+        assert!(fails_with(&[&[1], &[]], "must not be empty"));
+        assert!(fails_with(
+            &[&[1, 2], &[2]],
+            "authority 2 appears in the fork groups twice"
+        ));
+        assert!(fails_with(
+            &[&[1], &[4]],
+            "member 4 is not in the committee"
+        ));
     }
 
     #[test]

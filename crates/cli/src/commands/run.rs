@@ -3,7 +3,7 @@
 
 use std::{fs, path::PathBuf};
 
-use dag::{config::ImportExport, context::TokioCtx};
+use dag::context::TokioCtx;
 use execution::fake::FakeExecutor;
 use eyre::{Result, WrapErr, eyre};
 use replica::{
@@ -15,7 +15,7 @@ use validator::{
     generator::LoadGeneratorConfig, parameters::ValidatorParameters, validator::ValidatorBuilder,
 };
 
-use crate::{args::RunArgs, tracing::ValidatorTracing};
+use crate::{args::RunArgs, config, tracing::ValidatorTracing};
 
 pub async fn run(
     args: RunArgs,
@@ -38,13 +38,12 @@ pub async fn run(
     } = args;
     tracing::info!("Starting validator {authority}");
 
-    let public_config = PublicReplicaConfig::load(&public_config_path)?;
-    let private_config = PrivateReplicaConfig::load(&private_config_path)?;
-    let load_generator_config = load_generator_config_path
-        .map(|path| LoadGeneratorConfig::load(&path))
-        .transpose()?;
-    let parameters = validator_parameters_path
-        .map(|path| ValidatorParameters::load(&path))
+    let public_config: PublicReplicaConfig = config::load(&public_config_path)?;
+    let private_config: PrivateReplicaConfig = config::load(&private_config_path)?;
+    let load_generator_config: Option<LoadGeneratorConfig> =
+        load_generator_config_path.map(config::load).transpose()?;
+    let parameters: ValidatorParameters = validator_parameters_path
+        .map(config::load)
         .transpose()?
         .unwrap_or_default();
     tracing::info!("Finality protocol: {}", parameters.finality);
