@@ -15,7 +15,10 @@ use execution::{
     object::{ObjectId, Version},
     store::StateView,
 };
-use validator::metrics::{CLIENT_COMMIT_LATENCY_S, FINALIZE, SLOW};
+use validator::metrics::{
+    CHECKPOINT_DECISION_ACCOUNTING, CLIENT_COMMIT_LATENCY_S, DECISION_LATENCY_S, DECISIONS,
+    FINALIZE, SLOW,
+};
 
 #[tokio::test]
 async fn submitted_transactions_execute_identically_on_all_validators() {
@@ -60,8 +63,27 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
         assert!(client_commit.get_sample_sum() > 0.0);
     }
     // The shared registry serves scraping: validator and replica metrics both land in it.
-    for registry in testbed.registries() {
+    for (registry, validator) in testbed.registries().iter().zip(testbed.validators()) {
         let families: Vec<_> = registry.gather();
+        // The decision accounting exports every live decision and its latency.
+        let accounting = families
+            .iter()
+            .find(|family| family.name() == CHECKPOINT_DECISION_ACCOUNTING)
+            .expect("decision accounting must be registered");
+        let quantity = |name: &str| {
+            let metric = accounting.get_metric().iter().find(|metric| {
+                let labels: Vec<_> = metric.get_label().iter().map(|pair| pair.value()).collect();
+                labels == [FINALIZE, SLOW, name]
+            });
+            metric.expect("decided checkpoints").get_counter().value()
+        };
+        let certification = validator
+            .metrics()
+            .checkpoint_certification_latency_s(FINALIZE, SLOW);
+        assert_eq!(quantity(DECISIONS), certification.get_sample_count() as f64);
+        let latency_s = quantity(DECISION_LATENCY_S);
+        assert!((latency_s - certification.get_sample_sum()).abs() < 1e-9);
+
         assert!(
             families
                 .iter()

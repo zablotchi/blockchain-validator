@@ -368,6 +368,24 @@ fn latencies(
     })
 }
 
+/// Asserts that `validator`'s decision accounting counts and times exactly what its latency
+/// histograms observed, per outcome and path.
+fn assert_accounting_matches_histograms(
+    validator: &ValidatorHandle<SimulatorContext, FakeExecutor>,
+) {
+    for outcome in [FINALIZE, SKIP] {
+        for path in [FAST, SLOW] {
+            let histogram = validator
+                .metrics()
+                .checkpoint_certification_latency_s(outcome, path);
+            let (decisions, latency_s) = validator.metrics().decision_accounting(outcome, path);
+            assert_eq!(decisions, histogram.get_sample_count(), "{outcome} {path}");
+            let error = (latency_s - histogram.get_sample_sum()).abs();
+            assert!(error < 1e-9, "{outcome} {path}: {latency_s} s");
+        }
+    }
+}
+
 /// Each validator's count of finalized and skipped checkpoints.
 fn decisions(committee: &SimulatedTestbed) -> Vec<(u64, u64)> {
     committee
@@ -409,6 +427,7 @@ fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
             // Skipped transactions are never finalized: only finalized heights close end to
             // end.
             for (validator, (finalized, _)) in committee.validators().iter().zip(&decisions) {
+                assert_accounting_matches_histograms(validator);
                 let end_to_end = validator.metrics().end_to_end_latency_s();
                 assert_eq!(end_to_end.get_sample_count(), *finalized, "{finality}");
                 // C finalizes on the fast path here, and skips only by the commit sequence.

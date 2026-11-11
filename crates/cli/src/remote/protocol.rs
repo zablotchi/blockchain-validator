@@ -280,6 +280,15 @@ impl ProtocolMetrics for ValidatorProtocol {
                 name: validator::metrics::SUBDAG_EXECUTION_LATENCY_S.into(),
                 kind: MetricKind::Histogram,
             },
+            // Decision counts and latency sums since the process started, collected raw: a
+            // counter spec would become a one-minute rate. Exact means pair `decisions` and
+            // `latency_s` from the same tick, never across ticks: one name is one instant
+            // query, whose series come from one scrape per node. Totals are scrape-bounded:
+            // decisions after a node's last scrape, as when a fault kills it, are lost.
+            MetricSpec {
+                name: validator::metrics::CHECKPOINT_DECISION_ACCOUNTING.into(),
+                kind: MetricKind::Gauge,
+            },
             MetricSpec {
                 name: validator::metrics::SUBMITTED_TRANSACTIONS.into(),
                 kind: MetricKind::Counter,
