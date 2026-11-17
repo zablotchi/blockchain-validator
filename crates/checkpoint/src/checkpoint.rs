@@ -64,11 +64,7 @@ pub struct Certificate {
 }
 
 impl Certificate {
-    pub(crate) fn new(
-        anchor: BlockReference,
-        outcome: Outcome,
-        votes: Vec<BlockReference>,
-    ) -> Self {
+    pub fn new(anchor: BlockReference, outcome: Outcome, votes: Vec<BlockReference>) -> Self {
         Self {
             anchor,
             outcome,

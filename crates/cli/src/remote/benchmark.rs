@@ -55,6 +55,9 @@ impl RemoteBenchmarkDriver {
             Some(path) => config::load(path).wrap_err("Failed to load client's parameters")?,
             None => ClientParameters::default(),
         };
+        node_parameters
+            .check_proposal_budget(&client_parameters)
+            .wrap_err("Proposals could outgrow mysticeti's message limit")?;
 
         // Apply the commit side-effect before settings are snapshotted into per-benchmark
         // parameters by new_from_loads.

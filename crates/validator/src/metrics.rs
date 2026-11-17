@@ -35,6 +35,10 @@ pub const CHECKPOINT_PENDING_HEIGHTS: &str = "checkpoint_pending_heights";
 pub const CHECKPOINT_DECISION_ACCOUNTING: &str = "checkpoint_decision_accounting_total";
 pub const VALIDATOR_HALTED: &str = "validator_halted";
 pub const VALIDATOR_RETAINED_BYTES: &str = "validator_retained_bytes";
+pub const PROTOCOL_SUBMISSIONS_DEFERRED: &str = "validator_protocol_submissions_deferred_total";
+pub const PROTOCOL_PAYLOADS_SUBMITTED: &str = "validator_protocol_payloads_submitted_total";
+pub const MAX_PROPOSAL_BYTES: &str = "validator_max_proposal_bytes";
+pub const MAX_PROPOSAL_PROTOCOL_BYTES: &str = "validator_max_proposal_protocol_bytes";
 
 /// The `outcome` label of [`CHECKPOINT_CERTIFICATION_LATENCY_S`] and
 /// [`CHECKPOINT_FINALITY_LATENCY_S`], and its values.
@@ -78,6 +82,10 @@ pub struct ValidatorMetrics {
     decision_accounting: DecisionAccounting,
     halted: IntGaugeVec,
     retained_bytes: IntGauge,
+    protocol_submissions_deferred: IntCounter,
+    protocol_payloads_submitted: IntCounter,
+    max_proposal_bytes: IntGauge,
+    max_proposal_protocol_bytes: IntGauge,
 }
 
 impl ValidatorMetrics {
@@ -162,6 +170,30 @@ impl ValidatorMetrics {
                 registry,
             )
             .unwrap(),
+            protocol_submissions_deferred: register_int_counter_with_registry!(
+                PROTOCOL_SUBMISSIONS_DEFERRED,
+                "Events whose own votes and certificates waited for the protocol byte budget",
+                registry,
+            )
+            .unwrap(),
+            protocol_payloads_submitted: register_int_counter_with_registry!(
+                PROTOCOL_PAYLOADS_SUBMITTED,
+                "Own votes and certificates submitted to consensus",
+                registry,
+            )
+            .unwrap(),
+            max_proposal_bytes: register_int_gauge_with_registry!(
+                MAX_PROPOSAL_BYTES,
+                "The largest own proposal, serialized (bytes)",
+                registry,
+            )
+            .unwrap(),
+            max_proposal_protocol_bytes: register_int_gauge_with_registry!(
+                MAX_PROPOSAL_PROTOCOL_BYTES,
+                "The most framed bytes of own votes and certificates in one own proposal",
+                registry,
+            )
+            .unwrap(),
         })
     }
 
@@ -235,6 +267,27 @@ impl ValidatorMetrics {
         }
     }
 
+    pub(crate) fn inc_protocol_submissions_deferred(&self) {
+        self.protocol_submissions_deferred.inc();
+    }
+
+    pub(crate) fn inc_protocol_payloads_submitted(&self, count: u64) {
+        self.protocol_payloads_submitted.inc_by(count);
+    }
+
+    /// Raises the proposal-size gauges to an own proposal's serialized size and framed protocol
+    /// bytes, where they are larger.
+    pub(crate) fn observe_own_proposal(&self, bytes: u64, protocol_bytes: u64) {
+        for (gauge, value) in [
+            (&self.max_proposal_bytes, bytes),
+            (&self.max_proposal_protocol_bytes, protocol_bytes),
+        ] {
+            if value as i64 > gauge.get() {
+                gauge.set(value as i64);
+            }
+        }
+    }
+
     /// The raw metrics, for test assertions (`get`/`get_sample_count`/`get_sample_sum`).
     pub fn submitted_transactions(&self) -> &IntCounter {
         &self.submitted_transactions
@@ -279,6 +332,22 @@ impl ValidatorMetrics {
 
     pub fn retained_bytes(&self) -> &IntGauge {
         &self.retained_bytes
+    }
+
+    pub fn protocol_submissions_deferred(&self) -> &IntCounter {
+        &self.protocol_submissions_deferred
+    }
+
+    pub fn protocol_payloads_submitted(&self) -> &IntCounter {
+        &self.protocol_payloads_submitted
+    }
+
+    pub fn max_proposal_bytes(&self) -> &IntGauge {
+        &self.max_proposal_bytes
+    }
+
+    pub fn max_proposal_protocol_bytes(&self) -> &IntGauge {
+        &self.max_proposal_protocol_bytes
     }
 
     /// The decision count and latency sum of one `outcome` and `path` label pair.

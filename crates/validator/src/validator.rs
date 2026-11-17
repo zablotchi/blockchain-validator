@@ -45,7 +45,9 @@ use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
     fork::ForkInjection,
+    limits::{self, CLIENT_BATCH_BYTES, split_batch},
     metrics::{EVIDENCE_BUDGET, FAST, SLOW, ValidatorMetrics},
+    outbox::ProtocolOutbox,
     parameters::ValidatorParameters,
 };
 
@@ -141,6 +143,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             fork,
             phase_one_timeout,
             evidence_budget_bytes,
+            protocol_bytes_in_flight,
         } = self.parameters;
         eyre::ensure!(
             !finality.needs_bft_quorum() || quorum == 2 * committee.total_stake() / 3 + 1,
@@ -149,6 +152,13 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
         eyre::ensure!(
             ValidatorParameters::EVIDENCE_BUDGET_BYTES.contains(&evidence_budget_bytes),
             "evidence_budget_bytes must be between 4 KiB and 64 GiB, not {evidence_budget_bytes}"
+        );
+        let largest_payload = limits::max_protocol_payload(committee.len());
+        eyre::ensure!(
+            (largest_payload..=ValidatorParameters::MAX_PROTOCOL_BYTES_IN_FLIGHT)
+                .contains(&protocol_bytes_in_flight),
+            "protocol_bytes_in_flight must be between {largest_payload} (the largest protocol \
+                payload) and 4 MiB, not {protocol_bytes_in_flight}"
         );
         if let Some(fork) = &fork {
             let mut members = HashSet::new();
@@ -183,6 +193,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             public_config: self.public_config,
             wal: self.wal,
             phase_one_timeout,
+            protocol_bytes_in_flight,
             metrics: ValidatorMetrics::new(&self.registry),
             replica: self
                 .replica
@@ -200,6 +211,7 @@ pub struct Validator<E> {
     public_config: PublicReplicaConfig,
     wal: Option<PathBuf>,
     phase_one_timeout: Duration,
+    protocol_bytes_in_flight: u64,
     metrics: Arc<ValidatorMetrics>,
     replica: Replica,
     receiver: mpsc::Receiver<DagEvent>,
@@ -246,10 +258,12 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let max_block_size = self.public_config.parameters.dag.max_block_size;
         let Self {
             state,
+            authority,
             replica,
             receiver,
             metrics,
             phase_one_timeout,
+            protocol_bytes_in_flight,
             ..
         } = self;
 
@@ -261,6 +275,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             state,
             receiver,
             submitter: replica.transaction_client(),
+            outbox: ProtocolOutbox::new(authority, protocol_bytes_in_flight),
             metrics: metrics.clone(),
             phase_one_timeout,
             executed: executed_sender,
@@ -277,6 +292,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             halted,
             metrics,
             max_block_size,
+            max_transaction_size: limits::max_transaction_size(protocol_bytes_in_flight),
         })
     }
 
@@ -339,6 +355,7 @@ struct Driver<E, S> {
     state: ExecutionState<E>,
     receiver: mpsc::Receiver<DagEvent>,
     submitter: S,
+    outbox: ProtocolOutbox,
     metrics: Arc<ValidatorMetrics>,
     phase_one_timeout: Duration,
     /// The executed transaction count, starting from the replayed ones.
@@ -354,6 +371,7 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
             mut state,
             mut receiver,
             submitter: client,
+            mut outbox,
             metrics: driver_metrics,
             phase_one_timeout,
             executed: executed_sender,
@@ -383,9 +401,7 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
                 .into_iter()
                 .map(|checkpoint| Self::wrap(timestamp_ms, Payload::Attest(checkpoint)))
                 .collect();
-            if client.submit(attestations).await.is_err() {
-                tracing::debug!("re-attestation failed; shutting down");
-            }
+            Self::submit(&mut outbox, &client, &driver_metrics, attestations).await;
         }
 
         let mut count = *executed_sender.borrow();
@@ -423,6 +439,10 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
             let minted = match event {
                 None => None,
                 Some(DagEvent::Block(block)) => {
+                    if let Some(protocol_bytes) = outbox.observe_block(&block) {
+                        let bytes = block.serialized_bytes().len() as u64;
+                        driver_metrics.observe_own_proposal(bytes, protocol_bytes);
+                    }
                     if state.count_arrivals(&driver_metrics, now, &block) {
                         let _ = decided_sender.send(state.decided_everything());
                     }
@@ -454,9 +474,8 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
                 break;
             }
             // Attest to the minted checkpoint and submit concluded certificates through
-            // consensus: both ride this validator's own signed blocks. Failure is benign —
-            // the replica is shutting down, lost votes are resubmitted after replay, and
-            // certificates conclude again from them.
+            // consensus: both ride this validator's own signed blocks, behind any payloads an
+            // own proposal has made room for.
             let payloads: Vec<_> = minted
                 .map(Payload::Attest)
                 .into_iter()
@@ -469,11 +488,34 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
                 )
                 .map(|payload| Self::wrap(now.as_millis() as u64, payload))
                 .collect();
-            if !payloads.is_empty() && client.submit(payloads).await.is_err() {
-                tracing::debug!("submission failed; shutting down");
-            }
+            Self::submit(&mut outbox, &client, &driver_metrics, payloads).await;
         }
         (state.scheduler, state.certifier)
+    }
+
+    /// Queues one event's payloads (possibly none) and submits, in one batch, the queued ones
+    /// the protocol byte budget admits. Failure is benign: the replica is shutting down, lost
+    /// votes are resubmitted after replay, and certificates conclude again from them.
+    async fn submit(
+        outbox: &mut ProtocolOutbox,
+        client: &S,
+        metrics: &ValidatorMetrics,
+        payloads: Vec<ConsensusTransaction>,
+    ) {
+        let queued = !payloads.is_empty();
+        outbox.enqueue(payloads);
+        let batch = outbox.next_batch();
+        if !batch.is_empty() {
+            let count = batch.len() as u64;
+            if client.submit(batch).await.is_err() {
+                tracing::debug!("submission failed; shutting down");
+                return;
+            }
+            metrics.inc_protocol_payloads_submitted(count);
+        }
+        if queued && !outbox.is_empty() {
+            metrics.inc_protocol_submissions_deferred();
+        }
     }
 
     /// Wraps this validator's own payload, timestamped, for submission through consensus.
@@ -654,23 +696,24 @@ pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
     halted: watch::Receiver<Option<HaltReason>>,
     metrics: Arc<ValidatorMetrics>,
     max_block_size: usize,
+    /// The largest client transaction (serialized envelope) the proposal budget admits.
+    max_transaction_size: u64,
 }
 
 impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
-    /// Submits transactions to the replica; resolves once they are queued for inclusion in a
-    /// block, not once they are committed or executed. Every payload is stamped with the
-    /// submission time (one clock read per batch), from which mysticeti derives its
-    /// commit-latency metric.
+    /// Submits transactions to the replica, in batches of at most about
+    /// [`CLIENT_BATCH_BYTES`]; resolves once they are queued for inclusion in a block, not once
+    /// they are committed or executed. Every payload is stamped with the submission time (one
+    /// clock read per call), from which mysticeti derives its commit-latency metric. Fails,
+    /// submitting nothing, if a stamped transaction exceeds the proposal budget's ceiling.
     pub async fn submit(&self, transactions: Vec<Transaction>) -> eyre::Result<()> {
         let timestamp_ms = C::timestamp_utc().as_millis() as u64;
-        let transactions = transactions
-            .into_iter()
-            .map(|transaction| {
-                let envelope = Envelope::new(timestamp_ms, Payload::Execute(transaction));
-                ConsensusTransaction::new(envelope.to_bytes().into())
-            })
-            .collect();
-        self.replica.submit(transactions).await
+        let batches =
+            prepare_client_batches(timestamp_ms, transactions, self.max_transaction_size)?;
+        for batch in batches {
+            self.replica.submit(batch).await?;
+        }
+        Ok(())
     }
 
     /// The validator's metrics.
@@ -702,6 +745,7 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
             self.replica.authority(),
             config,
             self.max_block_size,
+            self.max_transaction_size,
             self.metrics.clone(),
         )
     }
@@ -748,6 +792,28 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
     }
 }
 
+/// Stamps client transactions into envelopes and splits them, in order, into batches closing
+/// at [`CLIENT_BATCH_BYTES`]; fails if an envelope exceeds `ceiling` bytes.
+fn prepare_client_batches(
+    timestamp_ms: u64,
+    transactions: Vec<Transaction>,
+    ceiling: u64,
+) -> eyre::Result<Vec<Vec<ConsensusTransaction>>> {
+    let envelopes = transactions
+        .into_iter()
+        .map(|transaction| {
+            let bytes = Envelope::new(timestamp_ms, Payload::Execute(transaction)).to_bytes();
+            eyre::ensure!(
+                bytes.len() as u64 <= ceiling,
+                "a {}-byte transaction exceeds the {ceiling}-byte ceiling of the proposal budget",
+                bytes.len()
+            );
+            Ok(ConsensusTransaction::new(bytes.into()))
+        })
+        .collect::<eyre::Result<_>>()?;
+    Ok(split_batch(envelopes, CLIENT_BATCH_BYTES))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{num::NonZeroU64, path::Path, sync::Arc, time::Duration};
@@ -765,7 +831,7 @@ mod tests {
         config::ImportExport,
         consensus::CommittedSubDag,
         context::TokioCtx,
-        crypto::CryptoEngine,
+        crypto::{AsBytes, CryptoEngine},
         output::DagEvent,
     };
     use execution::{
@@ -773,6 +839,7 @@ mod tests {
         fake::{FakeExecutor, FakeTransaction},
         object::ObjectId,
         scheduler::SequentialScheduler,
+        transaction::Transaction,
     };
     use prometheus::Registry;
     use replica::config::{PrivateReplicaConfig, PublicReplicaConfig, ReplicaParameters};
@@ -781,9 +848,13 @@ mod tests {
     use crate::{
         envelope::{Envelope, Payload},
         fork::ForkInjection,
+        limits::{self, CLIENT_BATCH_BYTES, framed_size},
         metrics::{EVIDENCE_BUDGET, FAST, FINALIZE, SKIP, SLOW, ValidatorMetrics},
+        outbox::ProtocolOutbox,
         parameters::ValidatorParameters,
-        validator::{Driver, ExecutionState, HaltReason, Submitter, ValidatorBuilder},
+        validator::{
+            Driver, ExecutionState, HaltReason, Submitter, ValidatorBuilder, prepare_client_batches,
+        },
     };
 
     impl ExecutionState<FakeExecutor> {
@@ -833,12 +904,14 @@ mod tests {
         /// its feeder at once.
         const EVENTS: usize = 4;
 
-        fn spawn(state: ExecutionState<FakeExecutor>) -> Self {
+        /// Spawns a driver pacing own payloads at `protocol_bytes_in_flight`.
+        fn spawn(state: ExecutionState<FakeExecutor>, protocol_bytes_in_flight: u64) -> Self {
             let (events, receiver) = mpsc::channel(Self::EVENTS);
             let (submitter, submitted) = mpsc::channel(1024);
             let (halted_sender, halted) = watch::channel(None);
             let metrics = metrics();
             let driver = Driver {
+                outbox: ProtocolOutbox::new(state.authority, protocol_bytes_in_flight),
                 state,
                 receiver,
                 submitter,
@@ -898,6 +971,8 @@ mod tests {
             .collect();
         DagEvent::Block(block(3, round, votes))
     }
+
+    const DEFAULT_IN_FLIGHT: u64 = 1 << 20;
 
     /// The smallest evidence budget a validator accepts.
     const SMALLEST_BUDGET: u64 = *ValidatorParameters::EVIDENCE_BUDGET_BYTES.start();
@@ -1114,7 +1189,7 @@ mod tests {
     async fn byzantine_early_votes_without_commits_halt_on_the_evidence_budget() {
         let mut state = state(FinalityProtocol::SuiBaseline);
         state.evidence_budget = SMALLEST_BUDGET;
-        let mut driver = TestDriver::spawn(state);
+        let mut driver = TestDriver::spawn(state, DEFAULT_IN_FLIGHT);
 
         // No commit is processed, so the cursor never passes the junk: the budget bounds it.
         let HaltReason::EvidenceBudget { bytes } = driver.halt_on_early_junk().await;
@@ -1127,7 +1202,7 @@ mod tests {
     async fn a_halted_validator_drains_events_without_deciding_or_submitting() {
         let mut state = state(FinalityProtocol::SuiBaseline);
         state.evidence_budget = SMALLEST_BUDGET;
-        let mut driver = TestDriver::spawn(state);
+        let mut driver = TestDriver::spawn(state, DEFAULT_IN_FLIGHT);
         driver.halt_on_early_junk().await;
 
         // Commits that would execute, mint and vote, and a quorum of votes for each, many
@@ -1155,6 +1230,52 @@ mod tests {
         assert!(submitted.recv().await.is_none());
     }
 
+    #[tokio::test]
+    async fn deferred_payloads_go_out_once_an_own_proposal_makes_room() {
+        // Room for one vote in flight (votes are of fixed size).
+        let vote = Envelope::new(0, Payload::Attest(Checkpoint::new_for_test(1))).to_bytes();
+        let vote_bytes = framed_size(&ConsensusTransaction::new(vote.into()));
+        let mut driver = TestDriver::spawn(state(FinalityProtocol::Baseline), vote_bytes);
+        let recv = async |driver: &mut TestDriver| {
+            let batch = tokio::time::timeout(Duration::from_secs(1), driver.submitted.recv());
+            batch
+                .await
+                .expect("a submission")
+                .expect("the driver must be running")
+        };
+
+        // Two mints: the first vote goes out, the second waits.
+        let first = subdag_at(1, vec![(0, vec![creation(1)])]);
+        driver.feed(DagEvent::Commit(first)).await;
+        let [first_vote] = recv(&mut driver).await.try_into().unwrap();
+        let second = subdag_at(2, vec![(0, vec![creation(2)])]);
+        driver.feed(DagEvent::Commit(second)).await;
+
+        // An own proposal carrying the first vote releases the second.
+        let proposal = block(0, 3, vec![first_vote.as_bytes().to_vec()]);
+        driver.feed(DagEvent::Block(proposal)).await;
+        let TestDriver {
+            events,
+            mut submitted,
+            metrics,
+            task,
+            ..
+        } = driver;
+        drop(events);
+        let (_, certifier) = task.await.unwrap();
+        let [second_vote] = submitted.recv().await.unwrap().try_into().unwrap();
+        assert!(submitted.recv().await.is_none());
+        // The votes for both minted checkpoints, in mint order.
+        let votes = [first_vote, second_vote]
+            .map(|vote| Envelope::attestation_from_bytes(vote.as_bytes()).expect("a vote"));
+        let pending: Vec<_> = certifier.pending().cloned().collect();
+        assert_eq!(votes.to_vec(), pending);
+        assert_eq!(metrics.protocol_submissions_deferred().get(), 1);
+        assert_eq!(metrics.protocol_payloads_submitted().get(), 2);
+        let proposal_bytes = metrics.max_proposal_protocol_bytes().get() as u64;
+        assert_eq!(proposal_bytes, vote_bytes);
+    }
+
     #[test]
     fn evidence_budgets_outside_the_supported_range_are_rejected() {
         let build = |evidence_budget_bytes| {
@@ -1180,6 +1301,96 @@ mod tests {
         assert!(build(SMALLEST_BUDGET).is_ok());
         assert!(build(64 << 30).is_ok());
         assert!(rejected((64 << 30) + 1));
+    }
+
+    /// A builder of validator 0 in a committee of four, with `parameters`.
+    fn builder(parameters: ValidatorParameters) -> ValidatorBuilder<FakeExecutor> {
+        let private_config =
+            PrivateReplicaConfig::new_for_benchmarks(Path::new("unused"), 4).remove(0);
+        ValidatorBuilder::new(
+            FakeExecutor,
+            Authority::new(0),
+            PublicReplicaConfig::new_for_tests(4),
+            private_config,
+        )
+        .with_parameters(parameters)
+    }
+
+    #[test]
+    fn protocol_bytes_in_flight_outside_the_supported_range_are_rejected() {
+        let build = |protocol_bytes_in_flight| {
+            builder(ValidatorParameters {
+                protocol_bytes_in_flight,
+                ..Default::default()
+            })
+            .build()
+        };
+        let rejected = |bytes| {
+            build(bytes).is_err_and(|error| error.to_string().contains("protocol_bytes_in_flight"))
+        };
+        let smallest = limits::max_protocol_payload(4);
+        let largest = ValidatorParameters::MAX_PROTOCOL_BYTES_IN_FLIGHT;
+        assert!(rejected(smallest - 1));
+        assert!(build(smallest).is_ok());
+        assert!(build(largest).is_ok());
+        assert!(rejected(largest + 1));
+    }
+
+    /// A client transaction whose stamped envelope takes exactly `size` bytes.
+    fn transaction_of_size(id: u64, size: usize) -> Transaction {
+        let create = |args| {
+            FakeTransaction::success_with_args(vec![], vec![ObjectId::new(id)], vec![], args).into()
+        };
+        let overhead = Envelope::new(0, Payload::Execute(create(vec![])))
+            .to_bytes()
+            .len();
+        create(vec![0; size - overhead])
+    }
+
+    #[test]
+    fn client_submissions_above_the_ceiling_are_rejected() {
+        let ceiling = limits::max_transaction_size(1 << 20);
+        let fits = transaction_of_size(1, ceiling as usize);
+        let [batch] = prepare_client_batches(7, vec![fits], ceiling)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(batch[0].as_bytes().len() as u64, ceiling);
+
+        let oversized = transaction_of_size(2, ceiling as usize + 1);
+        let small = transaction_of_size(3, 128);
+        assert!(prepare_client_batches(7, vec![small, oversized], ceiling).is_err());
+    }
+
+    #[test]
+    fn large_client_submissions_are_split_under_the_batch_cap() {
+        let transactions: Vec<_> = (0..40_000).map(|id| transaction_of_size(id, 512)).collect();
+        let batches = prepare_client_batches(7, transactions, 539).unwrap();
+        assert!(batches.len() > 1);
+        for (index, batch) in batches.iter().enumerate() {
+            // Each batch closes at the first payload reaching the cap.
+            let (last, rest) = batch.split_last().unwrap();
+            let rest: u64 = rest.iter().map(framed_size).sum();
+            assert!(rest < CLIENT_BATCH_BYTES);
+            if index + 1 < batches.len() {
+                assert!(rest + framed_size(last) >= CLIENT_BATCH_BYTES);
+            }
+        }
+        // In order, stamped.
+        let ids: Vec<_> = batches
+            .iter()
+            .flatten()
+            .map(|payload| {
+                let envelope = Envelope::from_bytes(payload.as_bytes()).unwrap();
+                assert_eq!(envelope.timestamp_ms(), 7);
+                let Payload::Execute(transaction) = envelope.into_payload() else {
+                    panic!("expected an execution payload");
+                };
+                transaction.inputs()[0].0
+            })
+            .collect();
+        let expected: Vec<_> = (0..40_000).map(ObjectId::new).collect();
+        assert_eq!(ids, expected);
     }
 
     #[test]

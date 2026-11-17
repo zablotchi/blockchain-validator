@@ -38,6 +38,7 @@ use simulator::{
 use validator::{
     fork::ForkInjection,
     generator::LoadGeneratorConfig,
+    limits::{self, PROPOSAL_BUDGET},
     metrics::{FAST, FINALIZE, SKIP, SLOW},
     parameters::ValidatorParameters,
     validator::{ValidatorBuilder, ValidatorHandle},
@@ -59,6 +60,13 @@ const SUBMISSION_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_BLOCK_SIZE: usize = 512;
 /// Fork injection fragments every this many checkpoint heights.
 const FORK_PERIOD: u64 = 5;
+const PROTOCOLS: [FinalityProtocol; 5] = [
+    FinalityProtocol::Baseline,
+    FinalityProtocol::SuiBaseline,
+    FinalityProtocol::A,
+    FinalityProtocol::B,
+    FinalityProtocol::C,
+];
 
 /// A committee of validators running under the simulator.
 struct SimulatedTestbed {
@@ -707,4 +715,77 @@ fn protocol_c_skips_wait_out_the_phase_one_timeout_deterministically() {
         // Proofs too, at every height: each validator's C proofs are deterministic per seed.
         assert_eq!(a.decision_log(), b.decision_log());
     }
+}
+
+/// Asserts that `validator`'s own proposals were measured, within the proposal budget and with
+/// at most `protocol_bytes_in_flight` of votes and certificates each.
+fn assert_proposals_within_budget(
+    validator: &ValidatorHandle<SimulatorContext, FakeExecutor>,
+    protocol_bytes_in_flight: u64,
+    context: impl Display,
+) {
+    let metrics = validator.metrics();
+    assert!(metrics.protocol_payloads_submitted().get() > 0, "{context}");
+    let proposal = metrics.max_proposal_bytes().get() as u64;
+    assert!(
+        proposal > 0 && proposal <= PROPOSAL_BUDGET,
+        "{context}: {proposal} B"
+    );
+    let protocol = metrics.max_proposal_protocol_bytes().get() as u64;
+    assert!(protocol > 0, "{context}");
+    assert!(
+        protocol <= protocol_bytes_in_flight,
+        "{context}: {protocol} B"
+    );
+}
+
+/// The byte budget never binds without forks, so every event's votes and certificates go out in
+/// one batch, at the same instant as before the budget existed.
+#[test]
+fn fork_free_runs_defer_nothing() {
+    for seed in [7, 42] {
+        for finality in PROTOCOLS {
+            SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
+                let parameters = ValidatorParameters {
+                    finality,
+                    ..Default::default()
+                };
+                let in_flight = parameters.protocol_bytes_in_flight;
+                let committee = generate_load(parameters).await;
+                for validator in committee.validators() {
+                    let deferred = validator.metrics().protocol_submissions_deferred();
+                    assert_eq!(deferred.get(), 0, "{finality} seed {seed}");
+                    assert_proposals_within_budget(validator, in_flight, finality);
+                }
+                committee.shutdown().await;
+            });
+        }
+    }
+}
+
+/// With room for a single certificate in flight, own votes and certificates wait for own
+/// proposals, and C still decides every height, identically everywhere.
+#[test]
+fn own_proposals_respect_a_binding_protocol_budget() {
+    SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
+        let in_flight = limits::max_protocol_payload(COMMITTEE_SIZE);
+        let parameters = ValidatorParameters {
+            protocol_bytes_in_flight: in_flight,
+            ..fragmented(FinalityProtocol::C)
+        };
+        let mut committee = generate_load(parameters).await;
+        committee.wait_for_decided().await;
+        for validator in committee.validators() {
+            assert_eq!(validator.halted(), None);
+            assert!(validator.metrics().protocol_submissions_deferred().get() > 0);
+            assert_proposals_within_budget(validator, in_flight, "binding budget");
+        }
+        let results = committee.shutdown().await;
+        for (_, certifier) in &results {
+            assert!(certifier.pending().next().is_none());
+        }
+        let certifiers = results.iter().map(|(_, certifier)| certifier);
+        let decisions = agreed_decisions(FinalityProtocol::C, certifiers, "binding budget");
+        assert!(decisions.len() as u64 > FORK_PERIOD);
+    });
 }

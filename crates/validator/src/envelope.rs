@@ -95,6 +95,14 @@ impl Envelope {
         }
     }
 
+    /// Whether consensus payload bytes are tagged as a vote or a certificate, without decoding
+    /// them.
+    pub(crate) fn is_protocol(bytes: &[u8]) -> bool {
+        bytes
+            .get(TAG)
+            .is_some_and(|tag| tag == ATTEST_TAG || tag == CERTIFY_TAG)
+    }
+
     /// Decodes the payload in consensus payload bytes if its variant tag is `tag`.
     fn tagged_from_bytes(bytes: &[u8], tag: [u8; 4]) -> Option<Payload> {
         if bytes.get(TAG) != Some(&tag[..]) {

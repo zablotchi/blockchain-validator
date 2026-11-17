@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A deterministic load generator, mirroring mysticeti's `replica::generator` — same pacing,
-//! seeding, clock caching, and block chunking — but emitting valid [`FakeTransaction`]
-//! payloads in timestamped [`Envelope`]s, so everything downstream of commit (execution,
-//! checkpoints, certification) fires.
+//! seeding, clock caching, and block chunking (by framed bytes, capped at
+//! [`CLIENT_BATCH_BYTES`]) — but emitting valid [`FakeTransaction`] payloads in timestamped
+//! [`Envelope`]s, so everything downstream of commit (execution, checkpoints, certification)
+//! fires.
 
-use std::{mem, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use dag::{
     authority::Authority, block::transaction::Transaction as ConsensusTransaction,
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     envelope::{Envelope, MAX_PAYLOAD_SIZE, Payload},
+    limits::{CLIENT_BATCH_BYTES, split_batch},
     metrics::ValidatorMetrics,
 };
 
@@ -79,7 +81,8 @@ mod load_generator_defaults {
 
 pub struct TransactionGenerator {
     client: TransactionClient,
-    max_block_size: usize,
+    /// Where batches close: the replica's block-size cap or [`CLIENT_BATCH_BYTES`].
+    batch_cap: u64,
     metrics: Arc<ValidatorMetrics>,
 }
 
@@ -90,11 +93,14 @@ impl TransactionGenerator {
     const AUTHORITY_SHIFT: u32 = 56;
     const RANDOM_MASK: u64 = (1 << Self::AUTHORITY_SHIFT) - 1;
 
+    /// Starts generating `config`'s load; `max_transaction_size` is the validator's
+    /// proposal-size ceiling on client transactions.
     pub fn start<C: Ctx>(
         client: TransactionClient,
         seed: Authority,
         config: LoadGeneratorConfig,
         max_block_size: usize,
+        max_transaction_size: u64,
         metrics: Arc<ValidatorMetrics>,
     ) -> C::JoinHandle<()> {
         assert!(config.load > 0, "load must be positive");
@@ -114,6 +120,11 @@ impl TransactionGenerator {
             config.transaction_size as u64 <= MAX_PAYLOAD_SIZE,
             "transaction_size must not exceed the {MAX_PAYLOAD_SIZE}-byte payload cap"
         );
+        assert!(
+            config.transaction_size as u64 <= max_transaction_size,
+            "transaction_size must not exceed {max_transaction_size} bytes, or proposals could \
+                outgrow the proposal budget"
+        );
         let args_len = config.transaction_size - overhead;
         tracing::info!(
             "Starting generator with {} transactions per second, initial delay {:?}",
@@ -125,7 +136,7 @@ impl TransactionGenerator {
         C::spawn(
             Self {
                 client,
-                max_block_size,
+                batch_cap: (max_block_size as u64).min(CLIENT_BATCH_BYTES),
                 metrics,
             }
             .run::<C>(config, seed.as_u64(), args_len, random),
@@ -160,27 +171,13 @@ impl TransactionGenerator {
         batch
     }
 
-    async fn ship_blocks(
-        &self,
-        batch: Vec<ConsensusTransaction>,
-        transaction_size: usize,
-        block_capacity: usize,
-    ) -> bool {
-        let mut block = Vec::with_capacity(block_capacity);
-        let mut block_size = 0;
-        for transaction in batch {
-            block.push(transaction);
-            block_size += transaction_size;
-
-            if block_size >= self.max_block_size {
-                let full_block = mem::replace(&mut block, Vec::with_capacity(block_capacity));
-                if self.client.submit(full_block).await.is_err() {
-                    return false;
-                }
-                block_size = 0;
+    async fn ship_blocks(&self, batch: Vec<ConsensusTransaction>) -> bool {
+        for block in split_batch(batch, self.batch_cap) {
+            if self.client.submit(block).await.is_err() {
+                return false;
             }
         }
-        block.is_empty() || self.client.submit(block).await.is_ok()
+        true
     }
 
     async fn run<C: Ctx>(
@@ -192,8 +189,6 @@ impl TransactionGenerator {
     ) {
         let intervals_per_second = 1000 / Self::TARGET_BLOCK_INTERVAL.as_millis() as usize;
         let transactions_per_interval = config.load.div_ceil(intervals_per_second);
-        let block_capacity =
-            (self.max_block_size / config.transaction_size).min(transactions_per_interval);
 
         let mut counter = 0u64;
 
@@ -224,10 +219,7 @@ impl TransactionGenerator {
                 &mut random,
             );
 
-            if !self
-                .ship_blocks(batch, config.transaction_size, block_capacity)
-                .await
-            {
+            if !self.ship_blocks(batch).await {
                 tracing::info!("Transaction channel closed, stopping generator");
                 return;
             }

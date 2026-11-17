@@ -56,6 +56,14 @@ impl Debug for NodeParameters {
     }
 }
 
+impl NodeParameters {
+    /// Fails unless `client`'s transactions keep every proposal within the proposal budget.
+    pub(crate) fn check_proposal_budget(&self, client: &ClientParameters) -> eyre::Result<()> {
+        let in_flight = self.validator.protocol_bytes_in_flight;
+        validator::limits::check_proposal_budget(client.transaction_size, in_flight)
+    }
+}
+
 impl ProtocolParameters for NodeParameters {}
 
 /// The load generator config distributed to every validator; the benchmark's total load is
@@ -301,6 +309,23 @@ impl ProtocolMetrics for ValidatorProtocol {
                 name: validator::metrics::VALIDATOR_RETAINED_BYTES.into(),
                 kind: MetricKind::Gauge,
             },
+            // Totals, collected raw like the accounting family.
+            MetricSpec {
+                name: validator::metrics::PROTOCOL_SUBMISSIONS_DEFERRED.into(),
+                kind: MetricKind::Gauge,
+            },
+            MetricSpec {
+                name: validator::metrics::PROTOCOL_PAYLOADS_SUBMITTED.into(),
+                kind: MetricKind::Gauge,
+            },
+            MetricSpec {
+                name: validator::metrics::MAX_PROPOSAL_BYTES.into(),
+                kind: MetricKind::Gauge,
+            },
+            MetricSpec {
+                name: validator::metrics::MAX_PROPOSAL_PROTOCOL_BYTES.into(),
+                kind: MetricKind::Gauge,
+            },
             MetricSpec {
                 name: validator::metrics::SUBMITTED_TRANSACTIONS.into(),
                 kind: MetricKind::Counter,
@@ -412,6 +437,18 @@ mod tests {
             name("finality: c\nphase_one_timeout: 250ms 1ns\n"),
             "mysticeti-l1-c-timeout-250000001ns"
         );
+    }
+
+    #[test]
+    fn transactions_must_fit_the_proposal_budget() {
+        let node: NodeParameters = serde_yaml::from_str(CONSENSUS).unwrap();
+        let client = |size| serde_yaml::from_str(&format!("transaction_size: {size}\n")).unwrap();
+        assert!(node.check_proposal_budget(&client(539)).is_ok());
+        assert!(node.check_proposal_budget(&client(540)).is_err());
+        // More protocol bytes in flight lower the ceiling.
+        let yaml = format!("{CONSENSUS}protocol_bytes_in_flight: 4194304\n");
+        let node: NodeParameters = serde_yaml::from_str(&yaml).unwrap();
+        assert!(node.check_proposal_budget(&client(512)).is_err());
     }
 
     #[test]

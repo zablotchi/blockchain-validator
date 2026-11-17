@@ -29,12 +29,20 @@ pub struct ValidatorParameters {
     /// node, so nodes may differ.
     #[serde(default = "ValidatorParameters::default_evidence_budget_bytes")]
     pub evidence_budget_bytes: u64,
+    /// The framed bytes of own votes and certificates submitted to consensus and not yet seen
+    /// in an own proposal: every own proposal carries at most this many. Excess payloads wait
+    /// for own proposals. It only paces this node, so nodes may differ.
+    #[serde(default = "ValidatorParameters::default_protocol_bytes_in_flight")]
+    pub protocol_bytes_in_flight: u64,
 }
 
 impl ValidatorParameters {
     pub const DEFAULT_FILENAME: &'static str = "validator-parameters.yaml";
     /// The accepted `evidence_budget_bytes`, from 4 KiB (for tests) to 64 GiB.
     pub const EVIDENCE_BUDGET_BYTES: RangeInclusive<u64> = 4 << 10..=64 << 30;
+    /// The largest accepted `protocol_bytes_in_flight`; the smallest is the largest protocol
+    /// payload ([`max_protocol_payload`](crate::limits::max_protocol_payload)).
+    pub const MAX_PROTOCOL_BYTES_IN_FLIGHT: u64 = 4 << 20;
 
     /// Mysticeti's round timeout for partially synchronous protocols
     /// (`Protocol::default_round_timeout`).
@@ -46,6 +54,11 @@ impl ValidatorParameters {
     pub fn default_evidence_budget_bytes() -> u64 {
         1 << 30
     }
+
+    /// 1 MiB: a few thousand votes, far above what a round carries without forks.
+    pub fn default_protocol_bytes_in_flight() -> u64 {
+        1 << 20
+    }
 }
 
 impl Default for ValidatorParameters {
@@ -55,6 +68,7 @@ impl Default for ValidatorParameters {
             fork: None,
             phase_one_timeout: Self::default_phase_one_timeout(),
             evidence_budget_bytes: Self::default_evidence_budget_bytes(),
+            protocol_bytes_in_flight: Self::default_protocol_bytes_in_flight(),
         }
     }
 }
@@ -91,6 +105,7 @@ mod tests {
             }),
             phase_one_timeout: Duration::from_millis(250),
             evidence_budget_bytes: 1 << 30,
+            protocol_bytes_in_flight: 1 << 20,
         };
         assert_eq!(loaded, expected);
     }
