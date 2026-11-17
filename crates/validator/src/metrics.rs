@@ -39,6 +39,7 @@ pub const PROTOCOL_SUBMISSIONS_DEFERRED: &str = "validator_protocol_submissions_
 pub const PROTOCOL_PAYLOADS_SUBMITTED: &str = "validator_protocol_payloads_submitted_total";
 pub const MAX_PROPOSAL_BYTES: &str = "validator_max_proposal_bytes";
 pub const MAX_PROPOSAL_PROTOCOL_BYTES: &str = "validator_max_proposal_protocol_bytes";
+pub const CHECKPOINT_RELEASE_WAITS: &str = "checkpoint_release_waits_total";
 
 /// The `outcome` label of [`CHECKPOINT_CERTIFICATION_LATENCY_S`] and
 /// [`CHECKPOINT_FINALITY_LATENCY_S`], and its values.
@@ -64,6 +65,8 @@ pub const DECISION_LATENCY_S: &str = "latency_s";
 pub const LABEL_REASON: &str = "reason";
 /// The retained state exceeded the evidence budget.
 pub const EVIDENCE_BUDGET: &str = "evidence_budget";
+/// The state diverged from the canonical one.
+pub const DIVERGENCE: &str = "divergence";
 
 /// Mysticeti's consensus-latency buckets: dense around the expected commit latency.
 const LATENCY_SEC_BUCKETS: &[f64] = &[
@@ -86,6 +89,7 @@ pub struct ValidatorMetrics {
     protocol_payloads_submitted: IntCounter,
     max_proposal_bytes: IntGauge,
     max_proposal_protocol_bytes: IntGauge,
+    release_waits: IntCounter,
 }
 
 impl ValidatorMetrics {
@@ -194,6 +198,12 @@ impl ValidatorMetrics {
                 registry,
             )
             .unwrap(),
+            release_waits: register_int_counter_with_registry!(
+                CHECKPOINT_RELEASE_WAITS,
+                "Checkpoints released later than concluded: they waited for a predecessor",
+                registry,
+            )
+            .unwrap(),
         })
     }
 
@@ -275,6 +285,10 @@ impl ValidatorMetrics {
         self.protocol_payloads_submitted.inc_by(count);
     }
 
+    pub(crate) fn inc_release_waits(&self) {
+        self.release_waits.inc();
+    }
+
     /// Raises the proposal-size gauges to an own proposal's serialized size and framed protocol
     /// bytes, where they are larger.
     pub(crate) fn observe_own_proposal(&self, bytes: u64, protocol_bytes: u64) {
@@ -340,6 +354,10 @@ impl ValidatorMetrics {
 
     pub fn protocol_payloads_submitted(&self) -> &IntCounter {
         &self.protocol_payloads_submitted
+    }
+
+    pub fn release_waits(&self) -> &IntCounter {
+        &self.release_waits
     }
 
     pub fn max_proposal_bytes(&self) -> &IntGauge {

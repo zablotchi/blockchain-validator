@@ -326,6 +326,11 @@ impl ProtocolMetrics for ValidatorProtocol {
                 name: validator::metrics::MAX_PROPOSAL_PROTOCOL_BYTES.into(),
                 kind: MetricKind::Gauge,
             },
+            // A total, collected raw like the accounting family.
+            MetricSpec {
+                name: validator::metrics::CHECKPOINT_RELEASE_WAITS.into(),
+                kind: MetricKind::Gauge,
+            },
             MetricSpec {
                 name: validator::metrics::SUBMITTED_TRANSACTIONS.into(),
                 kind: MetricKind::Counter,
@@ -387,7 +392,16 @@ impl ProtocolMetrics for ValidatorProtocol {
 
 #[cfg(test)]
 mod tests {
-    use crate::remote::protocol::NodeParameters;
+    use std::path::PathBuf;
+
+    use orchestrator::{collector::MetricKind, protocol::ProtocolMetrics};
+    use validator::metrics::{
+        CHECKPOINT_RELEASE_WAITS, MAX_PROPOSAL_BYTES, MAX_PROPOSAL_PROTOCOL_BYTES,
+        PROTOCOL_PAYLOADS_SUBMITTED, PROTOCOL_SUBMISSIONS_DEFERRED, VALIDATOR_HALTED,
+        VALIDATOR_RETAINED_BYTES,
+    };
+
+    use crate::remote::protocol::{NodeParameters, ValidatorProtocol};
 
     const CONSENSUS: &str = "consensus:\n  protocol: mysticeti\n  leader_count: 1\n";
 
@@ -395,6 +409,31 @@ mod tests {
         let yaml = format!("{CONSENSUS}{validator}");
         let parameters: NodeParameters = serde_yaml::from_str(&yaml).unwrap();
         format!("{parameters:?}")
+    }
+
+    /// The fork-recovery metrics are all collected, and raw: a counter spec would turn a total
+    /// into a one-minute rate.
+    #[test]
+    fn fork_recovery_metrics_are_collected_raw() {
+        let protocol = ValidatorProtocol {
+            working_dir: PathBuf::new(),
+        };
+        let specs = protocol.metrics();
+        for name in [
+            VALIDATOR_HALTED,
+            VALIDATOR_RETAINED_BYTES,
+            PROTOCOL_SUBMISSIONS_DEFERRED,
+            PROTOCOL_PAYLOADS_SUBMITTED,
+            MAX_PROPOSAL_BYTES,
+            MAX_PROPOSAL_PROTOCOL_BYTES,
+            CHECKPOINT_RELEASE_WAITS,
+        ] {
+            let kind = specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .map(|spec| &spec.kind);
+            assert!(matches!(kind, Some(MetricKind::Gauge)), "{name}");
+        }
     }
 
     #[test]

@@ -580,27 +580,23 @@ fn baselines_stall_at_the_first_fragmented_height() {
             let validators = decisions.into_iter().zip(contiguous).zip(&results);
             for (((finalized, skipped), contiguous), (_, certifier)) in validators {
                 assert_eq!(skipped, 0, "{finality}");
-                // Finality and end-to-end latency stop below the first fragmented height,
-                // while the pending heights keep growing.
+                // Heights are released in order, so nothing is decided from the first
+                // fragmented height on, not even the heights without a fork: certification,
+                // finality and end-to-end latency all stop below it, while the pending heights
+                // keep growing.
                 let stalled = FORK_PERIOD - 1;
                 let pending = certifier.pending().len() as i64;
                 assert_eq!(contiguous, (stalled, stalled, pending), "{finality}");
-                // The watermark stops below the first fragmented height for good, and every
-                // height from there on stays pending, although the ones without a fork
-                // finalized.
-                let minted = certifier.pending().count() as u64 + FORK_PERIOD - 1;
+                assert_eq!(finalized, stalled, "{finality}");
+                let minted = pending as u64 + stalled;
                 assert!(
                     minted > FORK_PERIOD,
                     "the run must pass a fragmented height"
                 );
-                assert_eq!(finalized, minted - minted / FORK_PERIOD, "{finality}");
-                assert_eq!(finalized, log.len() as u64, "{finality}");
-                let pending = (FORK_PERIOD..).zip(certifier.pending());
-                for (height, checkpoint) in pending {
-                    let decided = log.contains_key(&checkpoint.anchor());
-                    let fragmented = height % FORK_PERIOD == 0;
-                    assert_eq!(decided, !fragmented, "{finality} at height {height}");
-                }
+                // The decision log holds exactly the heights below it.
+                assert_eq!(log.len() as u64, stalled, "{finality}");
+                let mut pending = certifier.pending();
+                assert!(pending.all(|checkpoint| !log.contains_key(&checkpoint.anchor())));
             }
         });
     }
@@ -756,6 +752,28 @@ fn fork_free_runs_defer_nothing() {
                     let deferred = validator.metrics().protocol_submissions_deferred();
                     assert_eq!(deferred.get(), 0, "{finality} seed {seed}");
                     assert_proposals_within_budget(validator, in_flight, finality);
+                }
+                committee.shutdown().await;
+            });
+        }
+    }
+}
+
+/// Without forks, heights conclude in order, so releasing them in order delays none: every
+/// decision is observed when it was concluded, as before ordered release.
+#[test]
+fn fork_free_runs_never_wait_for_a_predecessor() {
+    for seed in [7, 42, 1234] {
+        for finality in PROTOCOLS {
+            SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
+                let parameters = ValidatorParameters {
+                    finality,
+                    ..Default::default()
+                };
+                let committee = generate_load(parameters).await;
+                for validator in committee.validators() {
+                    let waits = validator.metrics().release_waits().get();
+                    assert_eq!(waits, 0, "{finality} seed {seed}");
                 }
                 committee.shutdown().await;
             });

@@ -11,12 +11,12 @@ use std::{
 };
 
 use checkpoint::{
-    certifier::{CheckpointCertifier, CheckpointTimings},
+    certifier::{CheckpointCertifier, CheckpointTimings, Divergence, Item, Path, Released},
     checkpoint::Checkpoint,
 };
 use dag::{
     authority::Authority,
-    block::{Block, transaction::Transaction as ConsensusTransaction},
+    block::{Block, BlockReference, transaction::Transaction as ConsensusTransaction},
     consensus::CommittedSubDag,
     context::Ctx,
     crypto::AsBytes,
@@ -47,7 +47,7 @@ use crate::{
     envelope::{Envelope, Payload},
     fork::ForkInjection,
     limits::{self, CLIENT_BATCH_BYTES, split_batch},
-    metrics::{EVIDENCE_BUDGET, FAST, SLOW, ValidatorMetrics},
+    metrics::{DIVERGENCE, EVIDENCE_BUDGET, FAST, SLOW, ValidatorMetrics},
     outbox::ProtocolOutbox,
     parameters::ValidatorParameters,
 };
@@ -179,8 +179,11 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
                 }
             }
         }
-        let certifier =
+        let mut certifier =
             CheckpointCertifier::new(committee, finality, quorum, consensus.leader_count);
+        if fork.is_some() {
+            certifier = certifier.with_emulated_forks();
+        }
         Ok(Validator {
             state: ExecutionState {
                 scheduler: SequentialScheduler::new(self.engine),
@@ -189,6 +192,8 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
                 fork,
                 minted: 0,
                 last_commitment: Digest::default(),
+                timeouts: VecDeque::new(),
+                divergence: None,
                 evidence_budget: evidence_budget_bytes,
             },
             authority: self.authority,
@@ -231,6 +236,11 @@ struct ExecutionState<E> {
     /// The commitment of the latest minted checkpoint (genesis's before the first): the parent
     /// of the next.
     last_commitment: Digest,
+    /// C's phase-one timeouts in deadline order, one per pending checkpoint: the driver's clock
+    /// at mint (its time since start), the anchor and the generation it was minted at.
+    timeouts: VecDeque<(Duration, BlockReference, u32)>,
+    /// The released checkpoint where this validator's state diverged, if any.
+    divergence: Option<Divergence>,
     /// The bytes the certifier may retain before the validator halts.
     evidence_budget: u64,
 }
@@ -241,6 +251,9 @@ struct ExecutionState<E> {
 pub enum HaltReason {
     /// The certifier retained more than the evidence budget.
     EvidenceBudget { bytes: u64 },
+    /// The state diverged from the canonical one at the checkpoint anchored at `anchor`, and
+    /// this validator cannot recover yet.
+    Divergence { anchor: BlockReference },
 }
 
 impl HaltReason {
@@ -248,6 +261,7 @@ impl HaltReason {
     fn label(self) -> &'static str {
         match self {
             Self::EvidenceBudget { .. } => EVIDENCE_BUDGET,
+            Self::Divergence { .. } => DIVERGENCE,
         }
     }
 }
@@ -385,20 +399,18 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
         } = self;
         let client_latency = driver_metrics.client_commit_latency_s().local();
         let times_out = state.certifier.protocol().times_out();
+        // Phase-one timeouts are kept by the driver's clock since this instant.
+        let epoch = C::now();
         // Re-attest checkpoints undecided at replay: votes in flight at shutdown died
         // with the transaction queue, and a validator otherwise attests only once, so an
         // undecided checkpoint could stall forever. The certifier's per-author dedupe
         // makes resubmission idempotent — votes that did commit are simply ignored.
         let pending: Vec<_> = state.certifier.pending().cloned().collect();
-        // Phase-one timeouts by mint instant, in mint order; replayed checkpoints time
-        // from now.
-        let mut timeouts = VecDeque::new();
+        // Replayed checkpoints time from now.
         if times_out {
-            timeouts.extend(
-                pending
-                    .iter()
-                    .map(|checkpoint| (C::now(), checkpoint.anchor())),
-            );
+            for checkpoint in &pending {
+                state.arm_timeout(C::elapsed(&epoch), checkpoint.anchor());
+            }
         }
         if !pending.is_empty() {
             let timestamp_ms = C::timestamp_utc().as_millis() as u64;
@@ -408,15 +420,18 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
                 .collect();
             Self::submit(&mut outbox, &client, &driver_metrics, attestations).await;
         }
+        // Replay released into its own metrics; the live ones start from the replayed window.
+        state.settle(&driver_metrics, C::timestamp_utc());
 
         let mut count = *executed_sender.borrow();
         // Armed for the earliest timeout; it may outlive it, waking once for nothing.
         let mut timer = None;
         loop {
             if timer.is_none()
-                && let Some((minted, _)) = timeouts.front()
+                && let Some(&(minted, ..)) = state.timeouts.front()
             {
-                let remaining = phase_one_timeout.saturating_sub(C::elapsed(minted));
+                let elapsed = C::elapsed(&epoch).saturating_sub(minted);
+                let remaining = phase_one_timeout.saturating_sub(elapsed);
                 timer = Some(Box::pin(C::sleep(remaining)));
             }
             // Biased, so polling never depends on tokio's process-seeded RNG. Expired
@@ -434,11 +449,11 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
             };
             // Expired timeouts are checked on every event too: a busy stream must not
             // starve them.
-            while let Some((minted, anchor)) = timeouts.front()
-                && C::elapsed(minted) >= phase_one_timeout
+            while let Some(&(minted, anchor, generation)) = state.timeouts.front()
+                && C::elapsed(&epoch).saturating_sub(minted) >= phase_one_timeout
             {
-                state.certifier.expire(*anchor);
-                timeouts.pop_front();
+                state.certifier.expire(anchor, generation);
+                state.timeouts.pop_front();
             }
             let now = C::timestamp_utc();
             let minted = match event {
@@ -467,9 +482,9 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
                 }
             };
             if times_out && let Some(checkpoint) = &minted {
-                timeouts.push_back((C::now(), checkpoint.anchor()));
+                state.arm_timeout(C::elapsed(&epoch), checkpoint.anchor());
             }
-            if let Some(reason) = state.check_budget(&driver_metrics) {
+            if let Some(reason) = state.halt_reason(&driver_metrics) {
                 tracing::error!(?reason, "validator halted: discarding events from now on");
                 driver_metrics.set_halted(reason.label());
                 let _ = halted_sender.send(Some(reason));
@@ -548,43 +563,35 @@ impl<E: ExecutionEngine> ExecutionState<E> {
     ) -> (usize, Option<Checkpoint>) {
         let anchor = subdag.anchor;
         subdag.sort();
-        let mut votes = Vec::new();
-        let mut certificates = Vec::new();
+        // Votes and certificates by carrying block, in commit and payload order.
+        let mut carried = Vec::new();
         // Submission stamps reduce to their sum here, while the payloads are in hand.
         let mut stamp_sum_ms = 0u64;
-        let transactions: Vec<Transaction> = subdag
-            .blocks
-            .iter()
-            .flat_map(|block| {
-                let reference = *block.reference();
-                block
-                    .transactions()
-                    .iter()
-                    .map(move |payload| (reference, payload))
-            })
-            .filter_map(|(block, payload)| {
-                let envelope = Envelope::from_bytes(payload.as_bytes())
+        let mut transactions: Vec<Transaction> = Vec::new();
+        for block in &subdag.blocks {
+            let mut items = Vec::new();
+            for payload in block.transactions() {
+                let Ok(envelope) = Envelope::from_bytes(payload.as_bytes())
                     .inspect_err(|error| tracing::warn!(?error, "skipping undecodable payload"))
-                    .ok()?;
+                else {
+                    continue;
+                };
                 let stamp_ms = envelope.timestamp_ms();
                 match envelope.into_payload() {
                     Payload::Execute(transaction) => {
                         stamp_sum_ms += stamp_ms;
                         let submitted = Duration::from_millis(stamp_ms);
                         client_latency.observe(now.saturating_sub(submitted).as_secs_f64());
-                        Some(transaction)
+                        transactions.push(transaction);
                     }
-                    Payload::Attest(vote) => {
-                        votes.push((block, vote));
-                        None
-                    }
-                    Payload::Certify(certificate) => {
-                        certificates.push((block, certificate));
-                        None
-                    }
+                    Payload::Attest(vote) => items.push(Item::Vote(vote)),
+                    Payload::Certify(certificate) => items.push(Item::Certificate(certificate)),
                 }
-            })
-            .collect();
+            }
+            if !items.is_empty() {
+                carried.push((*block.reference(), items));
+            }
+        }
         let executed = self.scheduler.execute(&transactions).len();
         metrics.inc_executed_transactions(executed as u64);
         client_latency.flush();
@@ -605,11 +612,8 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 None => self.last_commitment,
             };
             self.last_commitment = commitment;
-            let (checkpoint, outcome) = self.certifier.push(anchor, commitment, parent, timings);
-            // Only arrivals held for the mint can decide it.
-            if let Some(outcome) = outcome {
-                metrics.observe_decision(now, outcome, FAST, timings);
-            }
+            // Arrivals held for the mint may conclude it; it is released with the rest below.
+            let (checkpoint, _) = self.certifier.push(anchor, commitment, parent, timings);
             checkpoint
         });
         if minted.is_none() {
@@ -617,75 +621,97 @@ impl<E: ExecutionEngine> ExecutionState<E> {
         }
         // A vote can never reference its own delivering sub-dag's checkpoint (it is created
         // only after that sub-dag commits), so recording after minting loses nothing.
-        for (block, vote) in votes {
-            if let Some((outcome, timings)) = self.certifier.record(block, vote) {
-                metrics.observe_decision(now, outcome, SLOW, timings);
-            }
-        }
-        // Certificates cite votes from their causal history: committed by now, recorded above.
-        for (block, certificate) in certificates {
-            if let Some((outcome, timings)) = self.certifier.record_certificate(block, &certificate)
-            {
-                metrics.observe_decision(now, outcome, SLOW, timings);
-            }
-        }
-        self.observe_contiguous(metrics, now, minted.is_some());
+        self.certifier.record_committed_subdag(carried);
+        self.settle(metrics, now);
         (executed, minted)
     }
 
-    /// Counts the checkpoint votes, and certificates if the protocol counts them, that `block`
+    /// Records the checkpoint votes, and certificates if the protocol counts them, that `block`
     /// carries as it enters the local DAG, if the protocol counts arrivals, and returns whether
-    /// one decided a checkpoint; `now` closes that checkpoint's latency metrics.
+    /// a checkpoint was released; `now` closes the released checkpoints' metrics.
     fn count_arrivals(&mut self, metrics: &ValidatorMetrics, now: Duration, block: &Block) -> bool {
         let protocol = self.certifier.protocol();
         if !protocol.counts_arrivals() {
             return false;
         }
         let certificates = protocol.counts_arriving_certificates();
-        let reference = *block.reference();
-        let mut decided = false;
-        for payload in block.transactions() {
-            let bytes = payload.as_bytes();
-            let counted = if let Some(vote) = Envelope::attestation_from_bytes(bytes) {
-                self.certifier.record_arrival(reference, vote)
-            } else if certificates
-                && let Some(certificate) = Envelope::certificate_from_bytes(bytes)
-            {
-                self.certifier
-                    .record_arriving_certificate(reference, certificate)
-            } else {
-                continue;
+        let items: Vec<_> = block
+            .transactions()
+            .iter()
+            .filter_map(|payload| {
+                let bytes = payload.as_bytes();
+                if let Some(vote) = Envelope::attestation_from_bytes(bytes) {
+                    Some(Item::Vote(vote))
+                } else if certificates {
+                    Envelope::certificate_from_bytes(bytes).map(Item::Certificate)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            return false;
+        }
+        self.certifier
+            .record_block_arrival(*block.reference(), items);
+        self.settle(metrics, now)
+    }
+
+    /// Releases what the certifier allows and closes each released checkpoint's metrics once, at
+    /// `now`: certification latency and the decision accounting on the path that concluded it,
+    /// finality, and end-to-end if it finalized. Drops the released checkpoints' timeouts,
+    /// updates the pending gauge, and keeps a divergence, which halts this validator. Returns
+    /// whether a checkpoint was released.
+    fn settle(&mut self, metrics: &ValidatorMetrics, now: Duration) -> bool {
+        self.certifier.release();
+        let mut released = false;
+        for Released {
+            outcome,
+            timings,
+            path,
+            waited,
+        } in self.certifier.take_released()
+        {
+            let path = match path {
+                Path::Fast => FAST,
+                Path::Slow => SLOW,
             };
-            if let Some((outcome, timings)) = counted {
-                metrics.observe_decision(now, outcome, FAST, timings);
-                decided = true;
-            }
-        }
-        if decided {
-            self.observe_contiguous(metrics, now, false);
-        }
-        decided
-    }
-
-    /// Closes the latency metrics, at `now`, of the checkpoints that became contiguously
-    /// decided, and updates the pending-heights gauge if the window changed (`minted` or
-    /// popped).
-    fn observe_contiguous(&mut self, metrics: &ValidatorMetrics, now: Duration, minted: bool) {
-        let mut popped = false;
-        for (outcome, timings) in self.certifier.take_contiguous() {
+            metrics.observe_decision(now, outcome, path, timings);
             metrics.observe_contiguous(now, outcome, timings);
-            popped = true;
+            if waited {
+                metrics.inc_release_waits();
+            }
+            released = true;
         }
-        if minted || popped {
-            metrics.set_pending_heights(self.certifier.pending().len());
+        if released {
+            let certifier = &self.certifier;
+            self.timeouts.retain(|&(_, anchor, generation)| {
+                certifier.generation(anchor) == Some(generation)
+            });
+        }
+        metrics.set_pending_heights(self.certifier.pending().len());
+        if let Some(divergence) = self.certifier.take_divergence() {
+            self.divergence.get_or_insert(divergence);
+        }
+        released
+    }
+
+    /// Arms C's phase-one timeout of the checkpoint minted at `anchor`, at `minted` on the
+    /// driver's clock, unless it was released already.
+    fn arm_timeout(&mut self, minted: Duration, anchor: BlockReference) {
+        if let Some(generation) = self.certifier.generation(anchor) {
+            self.timeouts.push_back((minted, anchor, generation));
         }
     }
 
-    /// The reason to halt, if the certifier retains more than the evidence budget; updates the
-    /// retained-bytes gauge.
-    fn check_budget(&self, metrics: &ValidatorMetrics) -> Option<HaltReason> {
+    /// The reason to halt, if the state diverged or the certifier retains more than the
+    /// evidence budget; updates the retained-bytes gauge.
+    fn halt_reason(&self, metrics: &ValidatorMetrics) -> Option<HaltReason> {
         let bytes = self.certifier.retained_bytes();
         metrics.set_retained_bytes(bytes);
+        if let Some(Divergence { anchor, .. }) = self.divergence {
+            return Some(HaltReason::Divergence { anchor });
+        }
         (bytes > self.evidence_budget).then_some(HaltReason::EvidenceBudget { bytes })
     }
 
@@ -829,7 +855,7 @@ fn prepare_client_batches(
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU64, path::Path, sync::Arc, time::Duration};
+    use std::{collections::VecDeque, num::NonZeroU64, path::Path, sync::Arc, time::Duration};
 
     use checkpoint::{
         certifier::{CheckpointCertifier, CheckpointTimings},
@@ -862,7 +888,7 @@ mod tests {
         envelope::{Envelope, Payload},
         fork::ForkInjection,
         limits::{self, CLIENT_BATCH_BYTES, framed_size},
-        metrics::{EVIDENCE_BUDGET, FAST, FINALIZE, SKIP, SLOW, ValidatorMetrics},
+        metrics::{DIVERGENCE, EVIDENCE_BUDGET, FAST, FINALIZE, SKIP, SLOW, ValidatorMetrics},
         outbox::ProtocolOutbox,
         parameters::ValidatorParameters,
         validator::{
@@ -891,6 +917,8 @@ mod tests {
             fork: None,
             minted: 0,
             last_commitment: Digest::default(),
+            timeouts: VecDeque::new(),
+            divergence: None,
             evidence_budget: ValidatorParameters::default_evidence_budget_bytes(),
         }
     }
@@ -1245,7 +1273,9 @@ mod tests {
         let mut driver = TestDriver::spawn(state, DEFAULT_IN_FLIGHT);
 
         // No commit is processed, so the cursor never passes the junk: the budget bounds it.
-        let HaltReason::EvidenceBudget { bytes } = driver.halt_on_early_junk().await;
+        let HaltReason::EvidenceBudget { bytes } = driver.halt_on_early_junk().await else {
+            panic!("the evidence budget must halt the driver");
+        };
         assert!(bytes > SMALLEST_BUDGET);
         assert_eq!(driver.metrics.retained_bytes().get(), bytes as i64);
         assert_eq!(driver.metrics.halted(EVIDENCE_BUDGET).get(), 1);
@@ -1446,20 +1476,111 @@ mod tests {
         assert_eq!(ids, expected);
     }
 
+    #[tokio::test]
+    async fn a_divergence_halts_until_recovery_exists() {
+        let mut driver = TestDriver::spawn(state(FinalityProtocol::A), DEFAULT_IN_FLIGHT);
+        let commit = subdag_at(1, vec![(0, vec![creation(1)])]);
+        driver.feed(DagEvent::Commit(commit)).await;
+        // f+1 others finalize a state this validator does not have.
+        let anchor = BlockReference::new_test(0, 1);
+        let theirs = Checkpoint::new(anchor, Digest::new_for_test(9), Digest::default());
+        let vote = Envelope::new(0, Payload::Attest(theirs)).to_bytes();
+        let votes = subdag_at(2, vec![(1, vec![vote.clone()]), (2, vec![vote])]);
+        driver.feed(DagEvent::Commit(votes)).await;
+
+        let halted = driver.halted.wait_for(Option::is_some);
+        let halted = tokio::time::timeout(Duration::from_secs(1), halted).await;
+        let reason = halted
+            .expect("the driver must halt")
+            .unwrap()
+            .expect("halted");
+        assert_eq!(reason, HaltReason::Divergence { anchor });
+        assert_eq!(driver.metrics.halted(DIVERGENCE).get(), 1);
+    }
+
+    #[test]
+    fn released_decisions_close_every_metric_once() {
+        let mut state = state(FinalityProtocol::SuiBaseline);
+        let metrics = metrics();
+        let mint = |state: &mut ExecutionState<FakeExecutor>, round, now| {
+            let subdag = subdag_at(round, vec![(0, vec![creation(round)])]);
+            let (_, minted) = state.execute(&metrics, now, subdag);
+            minted.expect("executing sub-dag must mint a checkpoint")
+        };
+        let first = mint(&mut state, 1, Duration::ZERO);
+        let second = mint(&mut state, 2, Duration::from_millis(500));
+        // The second height concludes on arrival at 1 s, while the first is open.
+        for block in quorum_of_votes(3, &second) {
+            assert!(!state.count_arrivals(&metrics, Duration::from_secs(1), &block));
+        }
+        // The first concludes at a commit at 2 s, and releases both.
+        let vote = Envelope::new(0, Payload::Attest(first)).to_bytes();
+        let votes = subdag_at(
+            4,
+            (0..3).map(|author| (author, vec![vote.clone()])).collect(),
+        );
+        state.execute(&metrics, Duration::from_secs(2), votes);
+
+        let fast = metrics.checkpoint_certification_latency_s(FINALIZE, FAST);
+        let slow = metrics.checkpoint_certification_latency_s(FINALIZE, SLOW);
+        assert_eq!((fast.get_sample_count(), fast.get_sample_sum()), (1, 1.5));
+        assert_eq!((slow.get_sample_count(), slow.get_sample_sum()), (1, 2.0));
+        let finality = metrics.checkpoint_finality_latency_s(FINALIZE);
+        assert_eq!(
+            (finality.get_sample_count(), finality.get_sample_sum()),
+            (2, 3.5)
+        );
+        assert_eq!(metrics.end_to_end_latency_s().get_sample_count(), 2);
+        assert_eq!(metrics.decision_accounting(FINALIZE, FAST), (1, 1.5));
+        assert_eq!(metrics.decision_accounting(FINALIZE, SLOW), (1, 2.0));
+        assert_eq!(metrics.release_waits().get(), 1);
+    }
+
+    #[test]
+    fn timers_never_outlive_their_pending_height() {
+        let mut state = state(FinalityProtocol::C);
+        let metrics = metrics();
+        let within_pending = |state: &ExecutionState<FakeExecutor>| {
+            assert!(state.timeouts.len() <= state.certifier.pending().len());
+        };
+        // Twenty heights minted and finalized one after another, before any timeout expires.
+        for height in 1..=20 {
+            let round = 10 * height;
+            let commit = subdag_at(round, vec![(0, vec![creation(height)])]);
+            let (_, minted) = state.execute(&metrics, Duration::ZERO, commit);
+            let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
+            state.arm_timeout(Duration::ZERO, checkpoint.anchor());
+            within_pending(&state);
+            for block in quorum_of_votes(round + 1, &checkpoint) {
+                state.count_arrivals(&metrics, Duration::ZERO, &block);
+                within_pending(&state);
+            }
+            let [phase_one] = state.certifier.take_certificates().try_into().unwrap();
+            let certify = Envelope::new(0, Payload::Certify(phase_one)).to_bytes();
+            for author in 0..3 {
+                let block = block(author, round + 2, vec![certify.clone()]);
+                state.count_arrivals(&metrics, Duration::ZERO, &block);
+                within_pending(&state);
+            }
+        }
+        assert_eq!(state.certifier.pending().count(), 0);
+        assert!(state.timeouts.is_empty());
+    }
+
     #[test]
     fn commits_executing_nothing_drop_the_arrivals_they_pass() {
         let mut state = state(FinalityProtocol::SuiBaseline);
         let metrics = metrics();
         let vote = Envelope::new(0, Payload::Attest(Checkpoint::new_for_test(1))).to_bytes();
         state.count_arrivals(&metrics, Duration::ZERO, &block(1, 3, vec![vote]));
-        assert_eq!(state.check_budget(&metrics), None);
+        assert_eq!(state.halt_reason(&metrics), None);
         assert!(metrics.retained_bytes().get() > 0);
 
         // A commit of a later round with nothing to execute: the voted anchor never mints.
         let unminted = subdag_at(2, vec![(1, vec![vec![0xFF; 16]])]);
         state.execute(&metrics, Duration::ZERO, unminted);
         assert_eq!(state.certifier.retained_bytes(), 0);
-        assert_eq!(state.check_budget(&metrics), None);
+        assert_eq!(state.halt_reason(&metrics), None);
         assert_eq!(metrics.retained_bytes().get(), 0);
     }
 
@@ -1798,7 +1919,7 @@ mod tests {
             state.count_arrivals(&metrics, Duration::from_secs(1), block);
         }
         assert!(state.certifier.take_certificates().is_empty());
-        state.certifier.expire(checkpoints[0].anchor());
+        state.certifier.expire(checkpoints[0].anchor(), 0);
         let [skip] = state.certifier.take_certificates().try_into().unwrap();
         assert_eq!(skip.outcome(), Outcome::Skip);
 
