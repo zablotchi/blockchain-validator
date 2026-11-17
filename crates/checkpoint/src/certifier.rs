@@ -176,10 +176,10 @@ pub struct CheckpointCertifier {
     /// Decided checkpoints the watermark passed since the last take, in commit order, with
     /// their mint timings.
     contiguous: Vec<(Outcome, CheckpointTimings)>,
-    /// Every decision by anchor, recorded when made, so that tests can compare decisions
-    /// behind a gap the watermark never passes.
+    /// Every decision by anchor, with its proof, recorded when made, so that tests can compare
+    /// decisions behind a gap the watermark never passes.
     #[cfg(any(test, feature = "decision-log"))]
-    decision_log: BTreeMap<BlockReference, Outcome>,
+    decision_log: BTreeMap<BlockReference, (Outcome, Vec<BlockReference>)>,
 }
 
 impl CheckpointCertifier {
@@ -415,7 +415,7 @@ impl CheckpointCertifier {
     }
 
     #[cfg(any(test, feature = "decision-log"))]
-    pub fn decision_log(&self) -> &BTreeMap<BlockReference, Outcome> {
+    pub fn decision_log(&self) -> &BTreeMap<BlockReference, (Outcome, Vec<BlockReference>)> {
         &self.decision_log
     }
 
@@ -599,12 +599,12 @@ impl CheckpointCertifier {
         }
         entry.tally = None;
         entry.certification = None;
-        entry.decision = Some(Decision::new(anchor, outcome, proof));
         #[cfg(any(test, feature = "decision-log"))]
         {
-            let previous = self.decision_log.insert(anchor, outcome);
+            let previous = self.decision_log.insert(anchor, (outcome, proof.clone()));
             debug_assert!(previous.is_none(), "{anchor:?} decided twice");
         }
+        entry.decision = Some(Decision::new(anchor, outcome, proof));
         (outcome, entry.timings)
     }
 
@@ -964,8 +964,13 @@ mod tests {
         // The certificate formed — timings surrendered — although not yet contiguous.
         assert!(timings.is_some());
         assert_eq!(certifier.highest_decided(), None);
-        let finalize = |n| (vote(n).anchor(), Outcome::Finalize(vote(n).commitment()));
-        assert_eq!(certifier.decision_log().clone(), [finalize(2)].into());
+        // Logged with the blocks of the votes that decided it, at round `round`.
+        let finalize = |n: u64, round| {
+            let proof = (0..3).map(|author| block(author, round)).collect();
+            let outcome = Outcome::Finalize(vote(n).commitment());
+            (vote(n).anchor(), (outcome, proof))
+        };
+        assert_eq!(certifier.decision_log().clone(), [finalize(2, 0)].into());
 
         // Late votes for the certified-but-not-yet-contiguous checkpoint change nothing, even
         // a full quorum of them (as when votes are counted on arrival and again at commit).
@@ -981,7 +986,7 @@ mod tests {
         assert_eq!(certified.proof(), [block(0, 0), block(1, 0), block(2, 0)]);
         assert_eq!(
             certifier.decision_log().clone(),
-            [finalize(1), finalize(2)].into()
+            [finalize(1, 1), finalize(2, 0)].into()
         );
 
         // The watermark keeps advancing from where it stands.

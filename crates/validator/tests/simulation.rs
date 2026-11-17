@@ -6,10 +6,19 @@
 //! of transactions is genuinely decided by consensus across concurrent proposers.
 
 use std::{
-    collections::BTreeMap, fmt::Display, num::NonZeroU64, path::Path, sync::Arc, time::Duration,
+    collections::{BTreeMap, BTreeSet},
+    fmt::Display,
+    num::NonZeroU64,
+    path::Path,
+    sync::Arc,
+    time::Duration,
 };
 
-use checkpoint::{certifier::CheckpointCertifier, checkpoint::Outcome, finality::FinalityProtocol};
+use checkpoint::{
+    certifier::CheckpointCertifier,
+    checkpoint::{Checkpoint, Outcome},
+    finality::FinalityProtocol,
+};
 use dag::{authority::Authority, block::BlockReference, context::Ctx, metrics::Metrics};
 use execution::{
     fake::{FakeExecutor, FakeTransaction},
@@ -35,6 +44,8 @@ use validator::{
 };
 
 const COMMITTEE_SIZE: usize = 4;
+/// 2f+1 validators of [`COMMITTEE_SIZE`].
+const QUORUM: usize = 2 * COMMITTEE_SIZE / 3 + 1;
 /// Executed-transaction cut at which the load generators are stopped.
 const TARGET_TRANSACTIONS: u64 = 1_000;
 /// One quiescence window: long enough for any in-flight block to commit everywhere.
@@ -172,18 +183,71 @@ type RunOutcome = (
     Vec<u64>,
 );
 
-/// The decisions by anchor, asserted identical across `certifiers`: unlike the watermark, they
-/// include the heights decided behind a gap.
+/// The decisions by anchor, asserted to agree across `certifiers`: unlike the watermark, they
+/// include the heights decided behind a gap. Proofs agree too under the protocols whose proofs
+/// follow the commit sequence. Sui-style proofs follow each validator's arrival order and C's
+/// either path, so there each proof is checked on its own: a quorum of distinct authors (unit
+/// stakes).
 fn agreed_decisions<'a>(
+    finality: FinalityProtocol,
     certifiers: impl IntoIterator<Item = &'a CheckpointCertifier>,
     context: impl Display,
 ) -> BTreeMap<BlockReference, Outcome> {
+    let shared_proofs = !matches!(
+        finality,
+        FinalityProtocol::SuiBaseline | FinalityProtocol::C
+    );
+    let outcomes = |certifier: &CheckpointCertifier| -> BTreeMap<_, _> {
+        let log = certifier.decision_log().iter();
+        log.map(|(anchor, (outcome, _))| (*anchor, *outcome))
+            .collect()
+    };
     let mut certifiers = certifiers.into_iter();
-    let reference = certifiers.next().expect("a validator").decision_log();
-    for certifier in certifiers {
-        assert_eq!(certifier.decision_log(), reference, "{context}");
+    let reference = certifiers.next().expect("a validator");
+    for certifier in std::iter::once(reference).chain(certifiers) {
+        if shared_proofs {
+            assert_eq!(
+                certifier.decision_log(),
+                reference.decision_log(),
+                "{context}"
+            );
+            continue;
+        }
+        assert_eq!(outcomes(certifier), outcomes(reference), "{context}");
+        for (anchor, (_, proof)) in certifier.decision_log() {
+            let authors: BTreeSet<_> = proof.iter().map(|block| block.authority).collect();
+            assert_eq!(authors.len(), proof.len(), "{context}: {anchor:?}");
+            assert!(authors.len() >= QUORUM, "{context}: {anchor:?}");
+        }
     }
-    reference.clone()
+    outcomes(reference)
+}
+
+#[test]
+fn sui_baseline_proofs_may_differ_while_outcomes_agree() {
+    let vote = Checkpoint::new_for_test(1);
+    let decide = |authors: [u64; 4]| {
+        let finality = FinalityProtocol::SuiBaseline;
+        let mut certifier = CheckpointCertifier::new_for_test(finality, vec![1; 4], 3, 1);
+        for author in authors {
+            certifier.record_arrival(BlockReference::new_test(author, 2), vote.clone());
+        }
+        certifier
+    };
+    let certifiers = [decide([0, 1, 2, 3]), decide([3, 2, 1, 0])];
+
+    let proofs = certifiers.each_ref().map(|certifier| {
+        let decision = certifier.highest_decided().expect("decided checkpoint");
+        decision
+            .proof()
+            .iter()
+            .map(|block| block.authority)
+            .collect::<BTreeSet<_>>()
+    });
+    assert_ne!(proofs[0], proofs[1]);
+    let decisions = agreed_decisions(FinalityProtocol::SuiBaseline, &certifiers, "orders");
+    let finalize = Outcome::Finalize(vote.commitment());
+    assert_eq!(decisions, [(vote.anchor(), finalize)].into());
 }
 
 fn run_once(seed: u64) -> RunOutcome {
@@ -286,7 +350,8 @@ fn validators_converge_under_simulation() {
         assert_eq!(other.highest_decided(), Some(certified));
         assert!(other.pending().next().is_none());
     }
-    agreed_decisions(results.iter().map(|(_, certifier)| certifier), "seed 7");
+    let certifiers = results.iter().map(|(_, certifier)| certifier);
+    agreed_decisions(FinalityProtocol::default(), certifiers, "seed 7");
     // Every validator's coupled object was created and modified at least once.
     for index in 0..COMMITTEE_SIZE {
         let latest = store
@@ -469,7 +534,8 @@ fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
 
             // Decisions follow the commit sequence: every validator skips the fragmented
             // heights and finalizes the rest, proofs included except under C.
-            let log = agreed_decisions(results.iter().map(|(_, certifier)| certifier), finality);
+            let certifiers = results.iter().map(|(_, certifier)| certifier);
+            let log = agreed_decisions(finality, certifiers, finality);
             let minted = log.len() as u64;
             assert!(
                 minted > FORK_PERIOD,
@@ -500,7 +566,8 @@ fn baselines_stall_at_the_first_fragmented_height() {
             let contiguous = contiguous(&committee);
             let results = committee.shutdown().await;
 
-            let log = agreed_decisions(results.iter().map(|(_, certifier)| certifier), finality);
+            let certifiers = results.iter().map(|(_, certifier)| certifier);
+            let log = agreed_decisions(finality, certifiers, finality);
             let validators = decisions.into_iter().zip(contiguous).zip(&results);
             for (((finalized, skipped), contiguous), (_, certifier)) in validators {
                 assert_eq!(skipped, 0, "{finality}");
@@ -560,7 +627,8 @@ fn certification_latencies(finality: FinalityProtocol) -> Vec<f64> {
         for (_, certifier) in &results {
             assert_eq!(decided(certifier), decided(reference), "{finality}");
         }
-        agreed_decisions(results.iter().map(|(_, certifier)| certifier), finality);
+        let certifiers = results.iter().map(|(_, certifier)| certifier);
+        agreed_decisions(finality, certifiers, finality);
         latencies
     })
 }
@@ -614,7 +682,7 @@ fn protocol_c_skips_wait_out_the_phase_one_timeout_deterministically() {
                 .into_iter()
                 .map(|(_, certifier)| certifier)
                 .collect();
-            let decisions = agreed_decisions(&certifiers, FinalityProtocol::C);
+            let decisions = agreed_decisions(FinalityProtocol::C, &certifiers, "seed 7");
             (skips, certifiers, decisions)
         })
     };
@@ -635,5 +703,7 @@ fn protocol_c_skips_wait_out_the_phase_one_timeout_deterministically() {
     assert_eq!(first_decisions, second_decisions);
     for (a, b) in first.iter().zip(&second) {
         assert_eq!(a.highest_decided(), b.highest_decided());
+        // Proofs too, at every height: each validator's C proofs are deterministic per seed.
+        assert_eq!(a.decision_log(), b.decision_log());
     }
 }
