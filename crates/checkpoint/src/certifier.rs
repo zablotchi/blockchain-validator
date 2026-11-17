@@ -115,7 +115,7 @@ impl Tally {
 /// A vote or certificate counted on arrival, with its carrying block, held until the mint of
 /// the checkpoint it is for.
 enum Arrival {
-    Vote(Digest, BlockReference),
+    Vote(Checkpoint, BlockReference),
     Certificate(Certificate, BlockReference),
 }
 
@@ -173,16 +173,20 @@ struct PendingCheckpoint {
     decision: Option<Decision>,
 }
 
+/// Votes' commitments by carrying block and parent, the first per key: a block may carry votes
+/// on several parents for one height (an honest re-vote shares a block with its original).
+type Votes = BTreeMap<(BlockReference, Digest), Digest>;
+
 /// What a pending checkpoint's certificates are checked and counted against.
 #[derive(Default)]
 struct Certification {
-    /// The committed votes by carrying block: the only votes a committed certificate may cite.
-    committed: BTreeMap<BlockReference, Digest>,
+    /// The committed votes: the only votes a committed certificate may cite, on its parent.
+    committed: Votes,
     /// The committed valid skip certificates.
     skips: Tally<()>,
-    /// Under C, the votes counted on arrival by carrying block: the only votes an arriving
-    /// certificate may cite.
-    arrived: BTreeMap<BlockReference, Digest>,
+    /// Under C, the votes counted on arrival: the only votes an arriving certificate may cite,
+    /// on its parent.
+    arrived: Votes,
     /// Under C, the valid phase-one certificates counted on arrival.
     phase_one: Tally,
 }
@@ -254,19 +258,22 @@ impl CheckpointCertifier {
         self.protocol
     }
 
-    /// Mints this validator's checkpoint for the sub-dag anchored at `anchor` and returns it,
-    /// ready to submit as this validator's vote, with the outcome if arrivals counted before
-    /// the mint decide it. The timings ride along and are surrendered when a later vote or
-    /// certificate decides it. Only arrivals can outrun minting: a vote or certificate
-    /// commits after the sub-dag it is for, which we process first.
+    /// Mints this validator's checkpoint for the sub-dag anchored at `anchor`, on `parent` (the
+    /// commitment it minted at the previous height), and returns it, ready to submit as this
+    /// validator's vote, with the outcome if arrivals counted before the mint decide it. Only
+    /// votes and certificates on `parent` count towards it. The timings ride along and are
+    /// surrendered when a later vote or certificate decides it. Only arrivals can outrun
+    /// minting: a vote or certificate commits after the sub-dag it is for, which we process
+    /// first.
     pub fn push(
         &mut self,
         anchor: BlockReference,
         commitment: Digest,
+        parent: Digest,
         timings: CheckpointTimings,
     ) -> (Checkpoint, Option<Outcome>) {
         let held = self.advance_cursor(anchor);
-        let local = Checkpoint::new(anchor, commitment);
+        let local = Checkpoint::new(anchor, commitment, parent);
         self.pending.push_back(PendingCheckpoint {
             local: local.clone(),
             timings,
@@ -277,7 +284,7 @@ impl CheckpointCertifier {
         });
         let index = self.pending.len() - 1;
         let decided = held.into_iter().find_map(|arrival| match arrival {
-            Arrival::Vote(commitment, block) => self.arrive(index, commitment, block),
+            Arrival::Vote(vote, block) => self.arrive(index, &vote, block),
             Arrival::Certificate(certificate, block) => {
                 self.count_certificate(index, &certificate, block)
             }
@@ -307,16 +314,16 @@ impl CheckpointCertifier {
 
     /// Records the committed vote for `checkpoint` carried by `block`, attributed to the
     /// block's author: votes ride their author's own signed blocks, so no authority can forge
-    /// another's. The first vote per authority and checkpoint counts; under certifying
-    /// protocols, committed votes back certificates instead. Returns the outcome and the mint
-    /// timings exactly when this vote decides the checkpoint.
+    /// another's. The first vote per authority on the pending checkpoint's parent counts; votes
+    /// on another parent never do. Under certifying protocols, committed votes back
+    /// certificates on their parent instead. Returns the outcome and the mint timings exactly
+    /// when this vote decides the checkpoint.
     pub fn record(
         &mut self,
         block: BlockReference,
         checkpoint: Checkpoint,
     ) -> Option<(Outcome, CheckpointTimings)> {
         let voted_anchor = checkpoint.anchor();
-        let commitment = checkpoint.commitment();
         let Some(index) = self.position(voted_anchor) else {
             if voted_anchor.round > self.decided_round() {
                 let author = block.authority;
@@ -326,11 +333,15 @@ impl CheckpointCertifier {
         };
         if self.protocol.certifies() {
             if let Some(certification) = &mut self.pending[index].certification {
-                certification.committed.entry(block).or_insert(commitment);
+                let key = (block, checkpoint.parent());
+                certification
+                    .committed
+                    .entry(key)
+                    .or_insert(checkpoint.commitment());
             }
             return None;
         }
-        let decided = self.count(index, commitment, block)?;
+        let decided = self.count(index, &checkpoint, block)?;
         self.advance_watermark();
         Some(decided)
     }
@@ -346,12 +357,11 @@ impl CheckpointCertifier {
         if !self.protocol.counts_arrivals() {
             return None;
         }
-        let commitment = checkpoint.commitment();
         let Some(index) = self.position(checkpoint.anchor()) else {
-            self.hold(checkpoint.anchor(), Arrival::Vote(commitment, block));
+            self.hold(checkpoint.anchor(), Arrival::Vote(checkpoint, block));
             return None;
         };
-        let decided = self.arrive(index, commitment, block)?;
+        let decided = self.arrive(index, &checkpoint, block)?;
         self.advance_watermark();
         Some(decided)
     }
@@ -384,8 +394,8 @@ impl CheckpointCertifier {
     /// Records the committed certificate carried by `block`, under certifying protocols: a
     /// valid phase-one certificate decides at once, even if its author's skip certificate
     /// committed first, and the first valid skip certificate of each authority counts until
-    /// they [settle](FinalityProtocol::settles_skip). Returns like
-    /// [`record`](CheckpointCertifier::record).
+    /// they [settle](FinalityProtocol::settles_skip). Certificates on another parent than the
+    /// pending checkpoint's are ignored. Returns like [`record`](CheckpointCertifier::record).
     pub fn record_certificate(
         &mut self,
         block: BlockReference,
@@ -395,7 +405,11 @@ impl CheckpointCertifier {
             return None;
         }
         let index = self.position(certificate.anchor())?;
-        let certification = self.pending[index].certification.as_deref()?;
+        let entry = &self.pending[index];
+        if certificate.parent() != entry.local.parent() {
+            return None;
+        }
+        let certification = entry.certification.as_deref()?;
         if !self.justified(&certification.committed, certificate) {
             return None;
         }
@@ -551,32 +565,41 @@ impl CheckpointCertifier {
 
     /// Counts the vote `block` carries for the pending checkpoint at `index` as it arrives,
     /// and returns like [`count`](CheckpointCertifier::count). Under C, the vote may also back
-    /// arriving certificates, even once this validator's own tally concluded.
+    /// arriving certificates on its parent, even once this validator's own tally concluded.
     fn arrive(
         &mut self,
         index: usize,
-        commitment: Digest,
+        vote: &Checkpoint,
         block: BlockReference,
     ) -> Option<(Outcome, CheckpointTimings)> {
         if self.protocol.counts_arriving_certificates()
             && let Some(certification) = &mut self.pending[index].certification
         {
-            certification.arrived.entry(block).or_insert(commitment);
+            let key = (block, vote.parent());
+            certification
+                .arrived
+                .entry(key)
+                .or_insert(vote.commitment());
         }
-        self.count(index, commitment, block)
+        self.count(index, vote, block)
     }
 
-    /// Counts a vote for the pending checkpoint at `index` into its tally, and returns the
-    /// outcome and mint timings exactly when it decides the checkpoint.
+    /// Counts a vote for the pending checkpoint at `index` into its tally, if on its parent,
+    /// and returns the outcome and mint timings exactly when it decides the checkpoint.
     fn count(
         &mut self,
         index: usize,
-        commitment: Digest,
+        vote: &Checkpoint,
         block: BlockReference,
     ) -> Option<(Outcome, CheckpointTimings)> {
         let entry = &mut self.pending[index];
+        // A vote in another instance attests another history.
+        if vote.parent() != entry.local.parent() {
+            return None;
+        }
         // Concluded: an observed decision or certificate can never change.
         let tally = entry.tally.as_mut()?;
+        let commitment = vote.commitment();
         let author = block.authority;
         let voted_anchor = entry.local.anchor();
         let stake = self
@@ -606,7 +629,8 @@ impl CheckpointCertifier {
         let entry = &mut self.pending[index];
         let proof = entry.tally.take().expect("tally concluded").proof(outcome);
         if self.protocol.certifies() {
-            let certificate = Certificate::new(entry.local.anchor(), outcome, proof);
+            let local = &entry.local;
+            let certificate = Certificate::new(local.anchor(), local.parent(), outcome, proof);
             self.certificates.push(certificate);
             return None;
         }
@@ -614,7 +638,7 @@ impl CheckpointCertifier {
     }
 
     /// Counts the arriving phase-one certificate `block` carries for the pending checkpoint at
-    /// `index`, if valid against the votes arrived so far, and returns like
+    /// `index`, if on its parent and valid against the votes arrived so far, and returns like
     /// [`count`](CheckpointCertifier::count).
     fn count_certificate(
         &mut self,
@@ -625,7 +649,11 @@ impl CheckpointCertifier {
         let Outcome::Finalize(commitment) = certificate.outcome() else {
             return None;
         };
-        let certification = self.pending[index].certification.as_deref()?;
+        let entry = &self.pending[index];
+        if certificate.parent() != entry.local.parent() {
+            return None;
+        }
+        let certification = entry.certification.as_deref()?;
         if !self.justified(&certification.arrived, certificate) {
             return None;
         }
@@ -639,17 +667,14 @@ impl CheckpointCertifier {
         Some(self.decide(index, Outcome::Finalize(commitment), proof))
     }
 
-    /// Whether `certificate` is valid against `votes`, the votes by carrying block it may cite:
-    /// it cites only those, from distinct authorities, and they justify its outcome.
-    fn justified(
-        &self,
-        votes: &BTreeMap<BlockReference, Digest>,
-        certificate: &Certificate,
-    ) -> bool {
+    /// Whether `certificate` is valid against `votes`, the votes it may cite: it cites only
+    /// votes on its own parent, from distinct authorities, and they justify its outcome.
+    fn justified(&self, votes: &Votes, certificate: &Certificate) -> bool {
         let anchor = certificate.anchor();
+        let parent = certificate.parent();
         let mut cited = Tally::new(certificate.votes().len());
         for block in certificate.votes() {
-            let counted = votes.get(block).and_then(|commitment| {
+            let counted = votes.get(&(*block, parent)).and_then(|commitment| {
                 let stake = self.committee.get_stake(block.authority)?;
                 cited.add(stake, *commitment, *block)
             });
@@ -731,6 +756,7 @@ impl CheckpointCertifier {
             certifier.push(
                 checkpoint.anchor(),
                 checkpoint.commitment(),
+                checkpoint.parent(),
                 CheckpointTimings::default(),
             );
         }
@@ -759,10 +785,16 @@ mod tests {
         Checkpoint::new_for_test(n)
     }
 
+    /// A vote for the checkpoint at `anchor` attesting `commitment`, on the default parent like
+    /// every [`vote`].
+    fn vote_for(anchor: BlockReference, commitment: Digest) -> Checkpoint {
+        Checkpoint::new(anchor, commitment, Digest::default())
+    }
+
     /// The checkpoint `decision` finalized; panics on a skip.
     fn finalized(decision: &Decision) -> Checkpoint {
         match decision.outcome() {
-            Outcome::Finalize(commitment) => Checkpoint::new(decision.anchor(), commitment),
+            Outcome::Finalize(commitment) => vote_for(decision.anchor(), commitment),
             Outcome::Skip => panic!("expected a finalized checkpoint"),
         }
     }
@@ -774,7 +806,7 @@ mod tests {
 
     /// A vote for the first checkpoint attesting a commitment of its own.
     fn diverged(byte: u8) -> Checkpoint {
-        Checkpoint::new(vote(1).anchor(), Digest::new_for_test(byte))
+        vote_for(vote(1).anchor(), Digest::new_for_test(byte))
     }
 
     /// The block of `author` carrying a certificate, after the blocks carrying votes.
@@ -784,7 +816,26 @@ mod tests {
 
     /// A certificate for the first checkpoint citing `votes`.
     fn certificate(outcome: Outcome, votes: Vec<BlockReference>) -> Certificate {
-        Certificate::new(vote(1).anchor(), outcome, votes)
+        Certificate::new(vote(1).anchor(), Digest::default(), outcome, votes)
+    }
+
+    /// A parent of its own, naming an instance other than the default parent's.
+    fn parent(byte: u8) -> Digest {
+        Digest::new_for_test(byte)
+    }
+
+    /// The vote for the first checkpoint on `parent`.
+    fn vote_on(parent: Digest) -> Checkpoint {
+        Checkpoint::new(vote(1).anchor(), vote(1).commitment(), parent)
+    }
+
+    /// A certifier over four equal validators that minted the first checkpoint on `parent`.
+    fn minted_on(protocol: FinalityProtocol, parent: Digest) -> CheckpointCertifier {
+        let mut certifier = CheckpointCertifier::new_for_test(protocol, vec![1; 4], 3, 0);
+        let local = vote_on(parent);
+        let timings = CheckpointTimings::default();
+        certifier.push(local.anchor(), local.commitment(), parent, timings);
+        certifier
     }
 
     #[test]
@@ -795,7 +846,12 @@ mod tests {
         };
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 0);
-        certifier.push(vote(1).anchor(), vote(1).commitment(), timings);
+        certifier.push(
+            vote(1).anchor(),
+            vote(1).commitment(),
+            Digest::default(),
+            timings,
+        );
 
         assert_eq!(certifier.record(block(0, 0), vote(1)), None);
         assert_eq!(certifier.record(block(1, 0), vote(1)), None);
@@ -907,9 +963,9 @@ mod tests {
     fn same_round_checkpoints_are_distinguished() {
         // Multi-leader protocols commit several anchors in the same round.
         let round = 7;
-        let first = || Checkpoint::new(BlockReference::new_test(0, round), Digest::default());
-        let second = || Checkpoint::new(BlockReference::new_test(1, round), Digest::default());
-        let unminted = || Checkpoint::new(BlockReference::new_test(2, round), Digest::default());
+        let first = || vote_for(BlockReference::new_test(0, round), Digest::default());
+        let second = || vote_for(BlockReference::new_test(1, round), Digest::default());
+        let unminted = || vote_for(BlockReference::new_test(2, round), Digest::default());
 
         let mut certifier = CheckpointCertifier::new(
             Committee::new_test(vec![1; 4]),
@@ -920,10 +976,12 @@ mod tests {
         certifier.push(
             first().anchor(),
             Digest::default(),
+            Digest::default(),
             CheckpointTimings::default(),
         );
         certifier.push(
             second().anchor(),
+            Digest::default(),
             Digest::default(),
             CheckpointTimings::default(),
         );
@@ -972,7 +1030,12 @@ mod tests {
         certifier.record_arrival(block(0, 0), vote(1));
         certifier.record_arrival(block(1, 0), vote(1));
         assert_eq!(
-            certifier.push(vote(1).anchor(), vote(1).commitment(), timings),
+            certifier.push(
+                vote(1).anchor(),
+                vote(1).commitment(),
+                Digest::default(),
+                timings
+            ),
             (vote(1), None)
         );
 
@@ -997,6 +1060,7 @@ mod tests {
         let (_, outcome) = certifier.push(
             vote(1).anchor(),
             vote(1).commitment(),
+            Digest::default(),
             CheckpointTimings::default(),
         );
         assert_eq!(outcome, Some(Outcome::Finalize(vote(1).commitment())));
@@ -1017,8 +1081,13 @@ mod tests {
             3,
             LEADERS,
         );
-        certifier.push(first, Digest::default(), CheckpointTimings::default());
-        let vote = Checkpoint::new(second, Digest::default());
+        certifier.push(
+            first,
+            Digest::default(),
+            Digest::default(),
+            CheckpointTimings::default(),
+        );
+        let vote = vote_for(second, Digest::default());
         for authority in 0..3 {
             assert_eq!(
                 certifier.record_arrival(block(authority, 0), vote.clone()),
@@ -1026,13 +1095,18 @@ mod tests {
             );
         }
 
-        let (_, outcome) = certifier.push(second, Digest::default(), CheckpointTimings::default());
+        let (_, outcome) = certifier.push(
+            second,
+            Digest::default(),
+            Digest::default(),
+            CheckpointTimings::default(),
+        );
         assert_eq!(outcome, Some(Outcome::Finalize(Digest::default())));
     }
 
     #[test]
     fn arrivals_for_anchors_never_minted_are_dropped_once_passed() {
-        let unminted = Checkpoint::new(BlockReference::new_test(2, 1), Digest::default());
+        let unminted = vote_for(BlockReference::new_test(2, 1), Digest::default());
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
         certifier.record_arrival(block(0, 0), unminted);
@@ -1041,12 +1115,14 @@ mod tests {
         certifier.push(
             vote(1).anchor(),
             vote(1).commitment(),
+            Digest::default(),
             CheckpointTimings::default(),
         );
         assert_eq!(certifier.early.len(), 1);
         certifier.push(
             vote(2).anchor(),
             vote(2).commitment(),
+            Digest::default(),
             CheckpointTimings::default(),
         );
         assert!(certifier.early.is_empty());
@@ -1056,7 +1132,7 @@ mod tests {
     fn fabricated_early_arrivals_at_or_above_the_carrying_round_are_refused() {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
-        let at = |round| Checkpoint::new(BlockReference::new_test(1, round), Digest::default());
+        let at = |round| vote_for(BlockReference::new_test(1, round), Digest::default());
         let carrying = BlockReference::new_test(0, 5);
 
         // An anchor of the carrying block's round or later is not committed when the block is
@@ -1074,7 +1150,7 @@ mod tests {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
         let anchor = |author| BlockReference::new_test(author, 1);
-        let vote = |author| Checkpoint::new(anchor(author), Digest::default());
+        let vote = |author| vote_for(anchor(author), Digest::default());
 
         // A Byzantine author votes, from several of its blocks, for every anchor of round 1:
         // only its first `LEADERS` anchors are held, each as often as it votes for them.
@@ -1089,7 +1165,12 @@ mod tests {
         for author in 0..3 {
             certifier.record_arrival(block(author, 0), vote(2));
         }
-        let (_, outcome) = certifier.push(anchor(2), Digest::default(), Default::default());
+        let (_, outcome) = certifier.push(
+            anchor(2),
+            Digest::default(),
+            Digest::default(),
+            Default::default(),
+        );
         assert_eq!(outcome, Some(Outcome::Finalize(Digest::default())));
     }
 
@@ -1120,11 +1201,11 @@ mod tests {
         certifier.observe_unminted_commit(unminted);
 
         // Nothing mints it any more, nor an anchor of an earlier round.
-        certifier.record_arrival(block(0, 0), Checkpoint::new(unminted, Digest::default()));
+        certifier.record_arrival(block(0, 0), vote_for(unminted, Digest::default()));
         certifier.record_arrival(block(0, 0), vote(1));
         assert!(certifier.early.is_empty());
         // Another anchor of its round still may, and a later one.
-        let same_round = Checkpoint::new(BlockReference::new_test(2, 2), Digest::default());
+        let same_round = vote_for(BlockReference::new_test(2, 2), Digest::default());
         certifier.record_arrival(block(0, 0), same_round);
         certifier.record_arrival(block(0, 0), vote(3));
         assert_eq!(certifier.early.len(), 2);
@@ -1140,7 +1221,7 @@ mod tests {
         certifier.record_arrival(block(1, 0), vote(2));
         let finalize = Outcome::Finalize(vote(2).commitment());
         let cited = vec![block(0, 0), block(1, 0), block(2, 0)];
-        let phase_one = Certificate::new(vote(2).anchor(), finalize, cited);
+        let phase_one = Certificate::new(vote(2).anchor(), Digest::default(), finalize, cited);
         certifier.record_arriving_certificate(carrier(0), phase_one);
         assert_eq!(
             certifier.retained_bytes(),
@@ -1148,7 +1229,12 @@ mod tests {
         );
 
         // The mint consumes its arrivals, and the cursor drops those it passes.
-        certifier.push(vote(1).anchor(), Digest::default(), Default::default());
+        certifier.push(
+            vote(1).anchor(),
+            Digest::default(),
+            Digest::default(),
+            Default::default(),
+        );
         assert_eq!(certifier.retained_bytes(), vote_bytes + certificate_bytes);
         certifier.observe_unminted_commit(BlockReference::new_test(1, 3));
         assert_eq!(certifier.retained_bytes(), 0);
@@ -1207,7 +1293,12 @@ mod tests {
             mean_timestamp_ms: n,
         };
         for n in 1..=2 {
-            certifier.push(vote(n).anchor(), vote(n).commitment(), timings(n));
+            certifier.push(
+                vote(n).anchor(),
+                vote(n).commitment(),
+                Digest::default(),
+                timings(n),
+            );
         }
 
         // The second height finalizes first: nothing is contiguous yet.
@@ -1262,6 +1353,164 @@ mod tests {
         certifier.record(block(0, 1), vote(1));
         let certified = certifier.highest_decided().expect("certified checkpoint");
         assert_eq!(certified.proof().len(), 4);
+    }
+
+    #[test]
+    fn votes_on_another_parent_are_not_counted() {
+        let (own, stale) = (vote_on(parent(1)), vote_on(parent(2)));
+        let finalize = Outcome::Finalize(own.commitment());
+        // Committed votes (the baseline) and arriving ones (the Sui-style baseline).
+        for protocol in [FinalityProtocol::Baseline, FinalityProtocol::SuiBaseline] {
+            let mut certifier = minted_on(protocol, parent(1));
+            let mut count = |block, vote: &Checkpoint| {
+                let counted = match protocol {
+                    FinalityProtocol::Baseline => certifier.record(block, vote.clone()),
+                    _ => certifier.record_arrival(block, vote.clone()),
+                };
+                counted.map(|(outcome, _)| outcome)
+            };
+            // Every author first votes for the same commitment in another instance: none of
+            // these votes counts, nor takes its author's place in the tally.
+            for author in 0..4 {
+                assert_eq!(count(block(author, 0), &stale), None, "{protocol}");
+            }
+            assert_eq!(count(block(0, 1), &own), None);
+            assert_eq!(count(block(1, 1), &own), None);
+            assert_eq!(count(block(2, 1), &own), Some(finalize), "{protocol}");
+        }
+    }
+
+    #[test]
+    fn votes_held_before_the_mint_on_another_parent_are_not_counted() {
+        let (own, stale) = (vote_on(parent(1)), vote_on(parent(2)));
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
+        for author in 0..4 {
+            certifier.record_arrival(block(author, 0), stale.clone());
+        }
+        let timings = CheckpointTimings::default();
+        let (_, outcome) = certifier.push(own.anchor(), own.commitment(), parent(1), timings);
+        assert_eq!(outcome, None);
+        // The held votes took no author's place in the tally.
+        let mut arrive = |author| {
+            let decided = certifier.record_arrival(block(author, 1), own.clone());
+            decided.map(|(outcome, _)| outcome)
+        };
+        assert_eq!(arrive(0), None);
+        assert_eq!(arrive(1), None);
+        assert_eq!(arrive(2), Some(Outcome::Finalize(own.commitment())));
+    }
+
+    #[test]
+    fn a_block_carrying_two_parents_for_one_height_records_both() {
+        // Each block carries its author's vote on a stale parent, attesting another commitment,
+        // then its re-vote on the pending checkpoint's parent.
+        let own = vote_on(parent(1));
+        let stale = Checkpoint::new(own.anchor(), Digest::new_for_test(9), parent(2));
+        let blocks = vec![block(0, 0), block(1, 0), block(2, 0)];
+        let finalize = Outcome::Finalize(own.commitment());
+        let certificate = Certificate::new(own.anchor(), parent(1), finalize, blocks.clone());
+
+        // Under B, a committed certificate cites the committed re-votes.
+        let mut certifier = minted_on(FinalityProtocol::B, parent(1));
+        for &block in &blocks {
+            certifier.record(block, stale.clone());
+            certifier.record(block, own.clone());
+        }
+        let decided = certifier.record_certificate(carrier(0), &certificate);
+        assert_eq!(decided.map(|(outcome, _)| outcome), Some(finalize));
+
+        // Under C, arriving phase-one certificates cite the arrived re-votes.
+        let mut certifier = minted_on(FinalityProtocol::C, parent(1));
+        for &block in &blocks {
+            certifier.record_arrival(block, stale.clone());
+            certifier.record_arrival(block, own.clone());
+        }
+        let mut arrive = |author| {
+            let decided =
+                certifier.record_arriving_certificate(carrier(author), certificate.clone());
+            decided.map(|(outcome, _)| outcome)
+        };
+        assert_eq!(arrive(0), None);
+        assert_eq!(arrive(1), None);
+        assert_eq!(arrive(2), Some(finalize));
+    }
+
+    #[test]
+    fn certificates_validate_against_votes_on_their_own_parent() {
+        // Three authors vote for the pending commitment in another instance, then in the
+        // pending checkpoint's.
+        let (own, stale) = (vote_on(parent(1)), vote_on(parent(2)));
+        let stale_blocks: Vec<_> = (0..3).map(|author| block(author, 0)).collect();
+        let own_blocks: Vec<_> = (0..3).map(|author| block(author, 1)).collect();
+        let finalize = Outcome::Finalize(own.commitment());
+        let citing =
+            |votes: &Vec<_>| Certificate::new(own.anchor(), parent(1), finalize, votes.clone());
+
+        // Under B, committed certificates.
+        let mut certifier = minted_on(FinalityProtocol::B, parent(1));
+        for (&stale_block, &own_block) in stale_blocks.iter().zip(&own_blocks) {
+            certifier.record(stale_block, stale.clone());
+            certifier.record(own_block, own.clone());
+        }
+        let decided = certifier.record_certificate(carrier(0), &citing(&stale_blocks));
+        assert_eq!(decided, None);
+        let decided = certifier.record_certificate(carrier(1), &citing(&own_blocks));
+        assert_eq!(decided.map(|(outcome, _)| outcome), Some(finalize));
+
+        // Under C, arriving phase-one certificates.
+        let mut certifier = minted_on(FinalityProtocol::C, parent(1));
+        for (&stale_block, &own_block) in stale_blocks.iter().zip(&own_blocks) {
+            certifier.record_arrival(stale_block, stale.clone());
+            certifier.record_arrival(own_block, own.clone());
+        }
+        let mut arrive = |author, votes| {
+            let decided = certifier.record_arriving_certificate(carrier(author), citing(votes));
+            decided.map(|(outcome, _)| outcome)
+        };
+        for author in 0..3 {
+            assert_eq!(arrive(author, &stale_blocks), None);
+        }
+        assert_eq!(arrive(0, &own_blocks), None);
+        assert_eq!(arrive(1, &own_blocks), None);
+        assert_eq!(arrive(2, &own_blocks), Some(finalize));
+    }
+
+    #[test]
+    fn certificates_on_another_parent_never_decide() {
+        // Valid in their own instance: a quorum's votes on the stale parent back them.
+        let stale = vote_on(parent(2));
+        let cited: Vec<_> = (0..3).map(|author| block(author, 0)).collect();
+        let finalize = Outcome::Finalize(stale.commitment());
+        let certificate = Certificate::new(stale.anchor(), parent(2), finalize, cited.clone());
+
+        // Committed, under B.
+        let mut certifier = minted_on(FinalityProtocol::B, parent(1));
+        for &block in &cited {
+            certifier.record(block, stale.clone());
+        }
+        assert_eq!(certifier.record_certificate(carrier(0), &certificate), None);
+
+        // Arriving, under C.
+        let mut certifier = minted_on(FinalityProtocol::C, parent(1));
+        for &block in &cited {
+            certifier.record_arrival(block, stale.clone());
+        }
+        for author in 0..3 {
+            let decided =
+                certifier.record_arriving_certificate(carrier(author), certificate.clone());
+            assert_eq!(decided, None);
+        }
+    }
+
+    #[test]
+    fn concluded_certificates_name_the_pending_checkpoints_parent() {
+        let own = vote_on(parent(1));
+        let mut certifier = minted_on(FinalityProtocol::B, parent(1));
+        certifier.record_arrival(block(0, 0), own.clone());
+        certifier.record_arrival(block(1, 0), own);
+        let [certificate] = certifier.take_certificates().try_into().unwrap();
+        assert_eq!(certificate.parent(), parent(1));
     }
 
     #[test]
@@ -1403,7 +1652,7 @@ mod tests {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::B, vec![1; 4], 3, 2);
         let anchor = vote(2).anchor();
-        let diverged = |byte| Checkpoint::new(anchor, Digest::new_for_test(byte));
+        let diverged = |byte| vote_for(anchor, Digest::new_for_test(byte));
         certifier.record(block(0, 0), vote(2));
         certifier.record(block(1, 0), vote(2));
         certifier.record(block(2, 0), diverged(2));
@@ -1411,9 +1660,14 @@ mod tests {
 
         // Validators saw different arrival orders: both certificates are valid.
         let cited = vec![block(1, 0), block(2, 0), block(3, 0)];
-        let skip = Certificate::new(anchor, Outcome::Skip, cited);
+        let skip = Certificate::new(anchor, Digest::default(), Outcome::Skip, cited);
         let finalize = Outcome::Finalize(vote(2).commitment());
-        let finalize = Certificate::new(anchor, finalize, vec![block(0, 0), block(1, 0)]);
+        let finalize = Certificate::new(
+            anchor,
+            Digest::default(),
+            finalize,
+            vec![block(0, 0), block(1, 0)],
+        );
         assert!(certifier.record_certificate(carrier(0), &skip).is_some());
         assert_eq!(certifier.record_certificate(carrier(1), &finalize), None);
 
@@ -1462,6 +1716,7 @@ mod tests {
         let (_, outcome) = certifier.push(
             vote(1).anchor(),
             vote(1).commitment(),
+            Digest::default(),
             CheckpointTimings::default(),
         );
         assert_eq!(outcome, None);
@@ -1505,7 +1760,7 @@ mod tests {
         let mut certifier =
             CheckpointCertifier::new_for_test(FinalityProtocol::C, vec![1; 4], 3, 4);
         let anchor = |n| vote(n).anchor();
-        let diverged = |n, byte| Checkpoint::new(anchor(n), Digest::new_for_test(byte));
+        let diverged = |n, byte| vote_for(anchor(n), Digest::new_for_test(byte));
 
         // A quorum voted without 2f+1 matching: the fourth vote may still make them.
         certifier.record_arrival(block(0, 0), vote(1));
@@ -1515,6 +1770,7 @@ mod tests {
         certifier.expire(anchor(1));
         let skip = Certificate::new(
             anchor(1),
+            Digest::default(),
             Outcome::Skip,
             vec![block(0, 0), block(1, 0), block(2, 0)],
         );
@@ -1761,6 +2017,7 @@ mod tests {
         let (_, outcome) = certifier.push(
             vote(1).anchor(),
             vote(1).commitment(),
+            Digest::default(),
             CheckpointTimings::default(),
         );
         assert_eq!(outcome, Some(finalize));

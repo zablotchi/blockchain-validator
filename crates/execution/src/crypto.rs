@@ -11,7 +11,7 @@ pub(crate) type Hasher = blake2::Blake2b<digest::consts::U32>;
 
 /// A 32-byte Blake2b-256 hash. The default value is the zero digest, which also serves as the
 /// genesis state commitment.
-#[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, Debug)]
 pub struct Digest([u8; 32]);
 
 impl Digest {

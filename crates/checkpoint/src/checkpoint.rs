@@ -12,16 +12,23 @@ use serde::{Deserialize, Serialize};
 /// Chaining is inherent: the commitment is the store's rolling hash, which already depends on
 /// the full ordered write history. The anchor alone identifies the checkpoint — ordering is
 /// local knowledge, so no sequence number travels. A checkpoint doubles as this validator's
-/// vote when submitted through consensus.
+/// vote when submitted through consensus. Its parent, the commitment its author minted at the
+/// previous height, names the instance it votes in: votes on different parents attest
+/// different histories and never count together.
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 pub struct Checkpoint {
     anchor: BlockReference,
     commitment: Digest,
+    parent: Digest,
 }
 
 impl Checkpoint {
-    pub(crate) fn new(anchor: BlockReference, commitment: Digest) -> Self {
-        Self { anchor, commitment }
+    pub fn new(anchor: BlockReference, commitment: Digest, parent: Digest) -> Self {
+        Self {
+            anchor,
+            commitment,
+            parent,
+        }
     }
 
     pub fn anchor(&self) -> BlockReference {
@@ -32,15 +39,24 @@ impl Checkpoint {
         self.commitment
     }
 
+    pub fn parent(&self) -> Digest {
+        self.parent
+    }
+
     pub fn round(&self) -> u64 {
         self.anchor.round
     }
 
     /// The checkpoint of the `n`-th executing sub-dag: anchored at round `n` (authority 0),
-    /// with the default commitment.
+    /// with the default commitment and parent, so each one's parent is its predecessor's
+    /// commitment.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(n: u64) -> Self {
-        Self::new(BlockReference::new_test(0, n), Digest::default())
+        Self::new(
+            BlockReference::new_test(0, n),
+            Digest::default(),
+            Digest::default(),
+        )
     }
 }
 
@@ -53,20 +69,28 @@ pub enum Outcome {
     Skip,
 }
 
-/// A claimed outcome for the checkpoint anchored at `anchor`, with the blocks carrying the
-/// votes that justify it: under C, a phase-one certificate if it finalizes. It verifies against
-/// the votes in its block's causal history alone, so it needs no signature of its own.
+/// A claimed outcome for the checkpoint anchored at `anchor` in the instance of `parent`, with
+/// the blocks carrying the votes that justify it: under C, a phase-one certificate if it
+/// finalizes. It verifies against the votes on its parent in its block's causal history alone,
+/// so it needs no signature of its own.
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 pub struct Certificate {
     anchor: BlockReference,
+    parent: Digest,
     outcome: Outcome,
     votes: Vec<BlockReference>,
 }
 
 impl Certificate {
-    pub fn new(anchor: BlockReference, outcome: Outcome, votes: Vec<BlockReference>) -> Self {
+    pub fn new(
+        anchor: BlockReference,
+        parent: Digest,
+        outcome: Outcome,
+        votes: Vec<BlockReference>,
+    ) -> Self {
         Self {
             anchor,
+            parent,
             outcome,
             votes,
         }
@@ -74,6 +98,10 @@ impl Certificate {
 
     pub fn anchor(&self) -> BlockReference {
         self.anchor
+    }
+
+    pub fn parent(&self) -> Digest {
+        self.parent
     }
 
     pub fn outcome(&self) -> Outcome {

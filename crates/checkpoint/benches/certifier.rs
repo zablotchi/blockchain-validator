@@ -45,6 +45,7 @@ fn mint(c: &mut Criterion) {
                     certifier.push(
                         checkpoint.anchor(),
                         checkpoint.commitment(),
+                        checkpoint.parent(),
                         CheckpointTimings::default(),
                     );
                 }

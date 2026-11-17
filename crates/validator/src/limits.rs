@@ -80,7 +80,12 @@ pub fn check_proposal_budget(
 pub fn max_protocol_payload(committee_size: usize) -> u64 {
     let reference = *Block::genesis(Authority::new(0)).reference();
     let votes = vec![reference; committee_size];
-    let certificate = Certificate::new(reference, Outcome::Finalize(Digest::default()), votes);
+    let certificate = Certificate::new(
+        reference,
+        Digest::default(),
+        Outcome::Finalize(Digest::default()),
+        votes,
+    );
     let bytes = Envelope::new(0, Payload::Certify(certificate)).to_bytes();
     bytes.len() as u64 + PAYLOAD_FRAMING
 }

@@ -26,7 +26,8 @@ use dag::{
     sync::network::Network,
 };
 use execution::{
-    engine::ExecutionEngine, scheduler::SequentialScheduler, transaction::Transaction,
+    crypto::Digest, engine::ExecutionEngine, scheduler::SequentialScheduler,
+    transaction::Transaction,
 };
 use prometheus::{Registry, local::LocalHistogram};
 use replica::{
@@ -187,6 +188,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
                 authority: self.authority,
                 fork,
                 minted: 0,
+                last_commitment: Digest::default(),
                 evidence_budget: evidence_budget_bytes,
             },
             authority: self.authority,
@@ -226,6 +228,9 @@ struct ExecutionState<E> {
     fork: Option<ForkInjection>,
     /// Checkpoints minted so far: the height of the latest one.
     minted: u64,
+    /// The commitment of the latest minted checkpoint (genesis's before the first): the parent
+    /// of the next.
+    last_commitment: Digest,
     /// The bytes the certifier may retain before the validator halts.
     evidence_budget: u64,
 }
@@ -593,7 +598,14 @@ impl<E: ExecutionEngine> ExecutionState<E> {
             if let Some(fork) = &self.fork {
                 commitment = fork.commitment(self.authority, self.minted, commitment);
             }
-            let (checkpoint, outcome) = self.certifier.push(anchor, commitment, timings);
+            // Under the emulated fork injection votes name the default parent: a skip changes no
+            // store there, so the height after a forked one has no canonical parent to name.
+            let parent = match self.fork {
+                Some(_) => Digest::default(),
+                None => self.last_commitment,
+            };
+            self.last_commitment = commitment;
+            let (checkpoint, outcome) = self.certifier.push(anchor, commitment, parent, timings);
             // Only arrivals held for the mint can decide it.
             if let Some(outcome) = outcome {
                 metrics.observe_decision(now, outcome, FAST, timings);
@@ -878,6 +890,7 @@ mod tests {
             authority: Authority::new(0),
             fork: None,
             minted: 0,
+            last_commitment: Digest::default(),
             evidence_budget: ValidatorParameters::default_evidence_budget_bytes(),
         }
     }
@@ -957,7 +970,12 @@ mod tests {
     fn vote_for(anchor: BlockReference) -> Checkpoint {
         let mut twin =
             CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 0);
-        let (vote, _) = twin.push(anchor, Digest::default(), CheckpointTimings::default());
+        let (vote, _) = twin.push(
+            anchor,
+            Digest::default(),
+            Digest::default(),
+            CheckpointTimings::default(),
+        );
         vote
     }
 
@@ -1115,6 +1133,40 @@ mod tests {
             diverged.push(minted.commitment() != state.scheduler.store().commitment());
         }
         assert_eq!(diverged, [false, true, false]);
+    }
+
+    #[test]
+    fn votes_name_the_previous_heights_commitment_as_parent() {
+        let mut state = state(FinalityProtocol::Baseline);
+        let metrics = metrics();
+        let minted: Vec<_> = (1..=3)
+            .map(|round| {
+                let blocks = vec![(0, vec![creation(round)])];
+                let (_, minted) = state.execute(&metrics, Duration::ZERO, subdag_at(round, blocks));
+                minted.expect("executing sub-dag must mint a checkpoint")
+            })
+            .collect();
+        // The first names genesis, every later one its predecessor's commitment.
+        assert_eq!(minted[0].parent(), Digest::default());
+        for pair in minted.windows(2) {
+            assert_eq!(pair[1].parent(), pair[0].commitment());
+        }
+    }
+
+    #[test]
+    fn emulated_forks_vote_on_the_default_parent() {
+        let mut state = state(FinalityProtocol::Baseline);
+        state.fork = Some(ForkInjection {
+            groups: vec![vec![Authority::new(0)]],
+            period: NonZeroU64::new(2).unwrap(),
+        });
+        let metrics = metrics();
+        for round in 1..=3 {
+            let blocks = vec![(0, vec![creation(round)])];
+            let (_, minted) = state.execute(&metrics, Duration::ZERO, subdag_at(round, blocks));
+            let minted = minted.expect("executing sub-dag must mint a checkpoint");
+            assert_eq!(minted.parent(), Digest::default());
+        }
     }
 
     #[test]

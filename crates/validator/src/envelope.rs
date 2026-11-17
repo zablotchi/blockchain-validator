@@ -116,9 +116,12 @@ impl Envelope {
 mod tests {
     use std::time::Duration;
 
-    use checkpoint::checkpoint::Checkpoint;
+    use checkpoint::checkpoint::{Certificate, Checkpoint, Outcome};
     use dag::block::transaction::Transaction as ConsensusTransaction;
-    use execution::transaction::{FunctionId, Transaction};
+    use execution::{
+        crypto::Digest,
+        transaction::{FunctionId, Transaction},
+    };
 
     use crate::envelope::{Envelope, Payload};
 
@@ -152,6 +155,30 @@ mod tests {
         let transaction = envelope(1234, vec![1, 2, 3]).to_bytes();
         assert_eq!(Envelope::attestation_from_bytes(&transaction), None);
         assert_eq!(Envelope::attestation_from_bytes(&attestation[..12]), None);
+    }
+
+    #[test]
+    fn votes_and_certificates_roundtrip_with_their_parent() {
+        let parent = Digest::new_for_test(1);
+        let anchor = Checkpoint::new_for_test(1).anchor();
+        let vote = Checkpoint::new(anchor, Digest::new_for_test(2), parent);
+        let attestation = Envelope::new(1234, Payload::Attest(vote.clone())).to_bytes();
+        assert_eq!(Envelope::attestation_from_bytes(&attestation), Some(vote));
+        let certificate = Certificate::new(anchor, parent, Outcome::Skip, vec![anchor]);
+        let certify = Envelope::new(1234, Payload::Certify(certificate.clone())).to_bytes();
+        assert_eq!(
+            Envelope::certificate_from_bytes(&certify),
+            Some(certificate)
+        );
+    }
+
+    /// Every block carries votes, so their size is pinned: the timestamp (8 bytes), the variant
+    /// tag (4), the anchor (56, its digest length-prefixed), the commitment and the parent (32
+    /// each).
+    #[test]
+    fn a_vote_envelope_grows_by_exactly_32_bytes() {
+        let bytes = Envelope::new(0, Payload::Attest(Checkpoint::new_for_test(1))).to_bytes();
+        assert_eq!(bytes.len(), 132);
     }
 
     #[test]

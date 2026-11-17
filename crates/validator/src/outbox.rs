@@ -94,7 +94,7 @@ mod tests {
         block::{Block, BlockReference, transaction::Transaction as ConsensusTransaction},
         crypto::CryptoEngine,
     };
-    use execution::{fake::FakeTransaction, object::ObjectId};
+    use execution::{crypto::Digest, fake::FakeTransaction, object::ObjectId};
 
     use crate::{
         envelope::{Envelope, Payload},
@@ -114,7 +114,7 @@ mod tests {
             .map(|author| BlockReference::new_test(author, 2))
             .collect();
         let anchor = Checkpoint::new_for_test(1).anchor();
-        let certificate = Certificate::new(anchor, Outcome::Skip, votes);
+        let certificate = Certificate::new(anchor, Digest::default(), Outcome::Skip, votes);
         let bytes = Envelope::new(0, Payload::Certify(certificate)).to_bytes();
         ConsensusTransaction::new(bytes.into())
     }
