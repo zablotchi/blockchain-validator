@@ -547,7 +547,7 @@ impl<E: ExecutionEngine> ExecutionState<E> {
         let mut certificates = Vec::new();
         // Submission stamps reduce to their sum here, while the payloads are in hand.
         let mut stamp_sum_ms = 0u64;
-        let transactions = subdag
+        let transactions: Vec<Transaction> = subdag
             .blocks
             .iter()
             .flat_map(|block| {
@@ -578,8 +578,9 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                         None
                     }
                 }
-            });
-        let executed = self.scheduler.execute(transactions).len();
+            })
+            .collect();
+        let executed = self.scheduler.execute(&transactions).len();
         metrics.inc_executed_transactions(executed as u64);
         client_latency.flush();
         let minted = (executed > 0).then(|| {

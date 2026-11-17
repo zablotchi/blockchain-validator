@@ -25,18 +25,16 @@ impl<E: ExecutionEngine> SequentialScheduler<E> {
     }
 
     /// Executes `transactions` in order, applying each transaction's output before executing the
-    /// next, and returns their statuses in the same order.
-    pub fn execute(
-        &mut self,
-        transactions: impl IntoIterator<Item = Transaction>,
-    ) -> Vec<ExecutionStatus> {
+    /// next, and returns their statuses in the same order. The transactions are only borrowed,
+    /// so the caller can keep them to execute again.
+    pub fn execute(&mut self, transactions: &[Transaction]) -> Vec<ExecutionStatus> {
         transactions
-            .into_iter()
+            .iter()
             .map(|transaction| {
                 if !transaction.verify() {
                     return ExecutionStatus::Aborted(AbortReason::InvalidTransaction);
                 }
-                let output = self.engine.execute(&self.store, &transaction);
+                let output = self.engine.execute(&self.store, transaction);
                 let status = output.status();
                 self.store.apply(output);
                 status
@@ -72,7 +70,7 @@ mod tests {
     #[test]
     fn transactions_execute_in_commit_order() {
         let mut scheduler = SequentialScheduler::new(FakeExecutor);
-        let statuses = scheduler.execute(batch());
+        let statuses = scheduler.execute(&batch());
 
         assert_eq!(statuses.len(), 3);
         assert_eq!(statuses[0], ExecutionStatus::Success);
@@ -91,7 +89,7 @@ mod tests {
         let id = ObjectId::new(1);
         let transaction = FakeTransaction::success(vec![], vec![id, id], vec![]).into();
         let mut scheduler = SequentialScheduler::new(FakeExecutor);
-        let statuses = scheduler.execute([transaction]);
+        let statuses = scheduler.execute(&[transaction]);
 
         assert_eq!(
             statuses,

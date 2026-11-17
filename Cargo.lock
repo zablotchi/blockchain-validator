@@ -1618,7 +1618,9 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake2 0.10.6",
+ "criterion",
  "digest 0.10.7",
+ "execution",
  "serde",
 ]
 

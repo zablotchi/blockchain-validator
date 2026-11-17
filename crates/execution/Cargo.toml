@@ -12,6 +12,13 @@ serde.workspace = true
 
 [dev-dependencies]
 bincode.workspace = true
+criterion.workspace = true
+# Self-dependency turning on the gated test constructors for the bench target.
+execution = { workspace = true, features = ["test-utils"] }
 
 [features]
 test-utils = []
+
+[[bench]]
+name = "store"
+harness = false

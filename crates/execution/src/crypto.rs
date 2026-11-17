@@ -32,9 +32,42 @@ impl Digest {
         Self(hasher.finalize().into())
     }
 
+    /// The commitment after skipping the height anchored at `anchor`: `H(self ‖ "skip" ‖
+    /// anchor)`. Folding the marker makes a skip change the commitment even when the skipped
+    /// height wrote nothing, so a vote computed before the skip never matches one after it.
+    pub fn skip(&self, anchor: &[u8]) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(self.0);
+        hasher.update(b"skip");
+        hasher.update(anchor);
+        Self(hasher.finalize().into())
+    }
+
     /// An arbitrary digest distinct per `byte`, for tests that need unequal commitments.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(byte: u8) -> Self {
         Self([byte; 32])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::crypto::Digest;
+
+    // Every validator folds the same marker into its commitment, so the exact bytes matter: pin
+    // them so any change to the hash, the tag or the field order fails loudly.
+    #[test]
+    fn skip_digests_are_stable_across_releases() {
+        let anchor: Vec<u8> = (1..=48).collect();
+        let hex: String = Digest::default()
+            .skip(&anchor)
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "20cba0f6910974f2a6f9e50d2d28518aacbb47b8f9704c23b3c4f417701d549d"
+        );
     }
 }
