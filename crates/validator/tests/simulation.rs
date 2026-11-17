@@ -276,6 +276,7 @@ fn run_once(seed: u64) -> RunOutcome {
         let mut delivered = Vec::with_capacity(COMMITTEE_SIZE);
         let mut certified_counts = Vec::with_capacity(COMMITTEE_SIZE);
         for validator in committee.validators() {
+            assert_eq!(validator.halted(), None);
             assert!(validator.executed() >= TARGET_TRANSACTIONS);
             assert!(validator.metrics().submitted_transactions().get() > 0);
             let histogram = validator.metrics().subdag_execution_latency_s();

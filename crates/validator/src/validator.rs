@@ -31,6 +31,7 @@ use execution::{
 use prometheus::{Registry, local::LocalHistogram};
 use replica::{
     builder::{ReplicaBuilder, StorageKind},
+    client::TransactionClient,
     config::{PrivateReplicaConfig, PublicReplicaConfig},
     replica::{Replica, ReplicaHandle},
 };
@@ -44,7 +45,7 @@ use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
     fork::ForkInjection,
-    metrics::{FAST, SLOW, ValidatorMetrics},
+    metrics::{EVIDENCE_BUDGET, FAST, SLOW, ValidatorMetrics},
     parameters::ValidatorParameters,
 };
 
@@ -129,20 +130,25 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
         let committee = self.public_config.committee();
         // Every protocol reads the full event stream, so all runs bear the same streaming cost.
         let (sender, receiver) = mpsc::channel(EVENT_CHANNEL_ROUNDS * (committee.len() + 1));
-        let quorum = self
+        let consensus = self
             .public_config
             .parameters
             .consensus
-            .to_protocol(&committee)?
-            .quorum_threshold;
+            .to_protocol(&committee)?;
+        let quorum = consensus.quorum_threshold;
         let ValidatorParameters {
             finality,
             fork,
             phase_one_timeout,
+            evidence_budget_bytes,
         } = self.parameters;
         eyre::ensure!(
             !finality.needs_bft_quorum() || quorum == 2 * committee.total_stake() / 3 + 1,
             "finality protocol {finality} needs a 2f+1 consensus quorum (no hybrid protocols)"
+        );
+        eyre::ensure!(
+            ValidatorParameters::EVIDENCE_BUDGET_BYTES.contains(&evidence_budget_bytes),
+            "evidence_budget_bytes must be between 4 KiB and 64 GiB, not {evidence_budget_bytes}"
         );
         if let Some(fork) = &fork {
             let mut members = HashSet::new();
@@ -162,7 +168,8 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
                 }
             }
         }
-        let certifier = CheckpointCertifier::new(committee, finality, quorum);
+        let certifier =
+            CheckpointCertifier::new(committee, finality, quorum, consensus.leader_count);
         Ok(Validator {
             state: ExecutionState {
                 scheduler: SequentialScheduler::new(self.engine),
@@ -170,6 +177,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
                 authority: self.authority,
                 fork,
                 minted: 0,
+                evidence_budget: evidence_budget_bytes,
             },
             authority: self.authority,
             public_config: self.public_config,
@@ -206,6 +214,25 @@ struct ExecutionState<E> {
     fork: Option<ForkInjection>,
     /// Checkpoints minted so far: the height of the latest one.
     minted: u64,
+    /// The bytes the certifier may retain before the validator halts.
+    evidence_budget: u64,
+}
+
+/// Why a validator halted: it keeps running consensus, so the replica never backs up and the
+/// run completes, but it executes, decides and submits nothing more.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HaltReason {
+    /// The certifier retained more than the evidence budget.
+    EvidenceBudget { bytes: u64 },
+}
+
+impl HaltReason {
+    /// The `reason` label of the halt gauge.
+    fn label(self) -> &'static str {
+        match self {
+            Self::EvidenceBudget { .. } => EVIDENCE_BUDGET,
+        }
+    }
 }
 
 impl<E: ExecutionEngine + Send + 'static> Validator<E> {
@@ -218,132 +245,36 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let replayed = self.replay()?;
         let max_block_size = self.public_config.parameters.dag.max_block_size;
         let Self {
-            mut state,
+            state,
             replica,
-            mut receiver,
+            receiver,
             metrics,
             phase_one_timeout,
             ..
         } = self;
 
         let replica = replica.run::<C>().await?;
-        let client = replica.transaction_client();
         let (executed_sender, executed) = watch::channel(replayed);
         let (decided_sender, decided) = watch::channel(state.decided_everything());
-        let driver_metrics = metrics.clone();
-        let driver = C::spawn(async move {
-            let client_latency = driver_metrics.client_commit_latency_s().local();
-            let times_out = state.certifier.protocol().times_out();
-            // Re-attest checkpoints undecided at replay: votes in flight at shutdown died
-            // with the transaction queue, and a validator otherwise attests only once, so an
-            // undecided checkpoint could stall forever. The certifier's per-author dedupe
-            // makes resubmission idempotent — votes that did commit are simply ignored.
-            let pending: Vec<_> = state.certifier.pending().cloned().collect();
-            // Phase-one timeouts by mint instant, in mint order; replayed checkpoints time
-            // from now.
-            let mut timeouts = VecDeque::new();
-            if times_out {
-                timeouts.extend(
-                    pending
-                        .iter()
-                        .map(|checkpoint| (C::now(), checkpoint.anchor())),
-                );
-            }
-            if !pending.is_empty() {
-                let timestamp_ms = C::timestamp_utc().as_millis() as u64;
-                let attestations = pending
-                    .into_iter()
-                    .map(|checkpoint| Self::wrap(timestamp_ms, Payload::Attest(checkpoint)))
-                    .collect();
-                if client.submit(attestations).await.is_err() {
-                    tracing::debug!("re-attestation failed; shutting down");
-                }
-            }
-
-            let mut count = replayed;
-            // Armed for the earliest timeout; it may outlive it, waking once for nothing.
-            let mut timer = None;
-            loop {
-                if timer.is_none()
-                    && let Some((minted, _)) = timeouts.front()
-                {
-                    let remaining = phase_one_timeout.saturating_sub(C::elapsed(minted));
-                    timer = Some(Box::pin(C::sleep(remaining)));
-                }
-                // Biased, so polling never depends on tokio's process-seeded RNG. Expired
-                // timeouts apply before every event either way, so the order is not observable.
-                let event = select! {
-                    biased;
-                    () = async { timer.as_mut().expect("guarded").await }, if timer.is_some() => {
-                        timer = None;
-                        None
-                    }
-                    event = receiver.recv() => match event {
-                        Some(event) => Some(event),
-                        None => break,
-                    },
-                };
-                // Expired timeouts are checked on every event too: a busy stream must not
-                // starve them.
-                while let Some((minted, anchor)) = timeouts.front()
-                    && C::elapsed(minted) >= phase_one_timeout
-                {
-                    state.certifier.expire(*anchor);
-                    timeouts.pop_front();
-                }
-                let now = C::timestamp_utc();
-                let minted = match event {
-                    None => None,
-                    Some(DagEvent::Block(block)) => {
-                        if state.count_arrivals(&driver_metrics, now, &block) {
-                            let _ = decided_sender.send(state.decided_everything());
-                        }
-                        None
-                    }
-                    Some(DagEvent::Commit(subdag)) => {
-                        // The clock starts at delivery (idle waiting is not latency) and stops
-                        // after execution, checkpoint minting, and vote recording.
-                        let start = C::now();
-                        let (executed, minted) =
-                            state.execute_subdag(&driver_metrics, &client_latency, now, subdag);
-                        driver_metrics.observe_subdag_execution_latency(C::elapsed(&start));
-                        count += executed as u64;
-                        let _ = executed_sender.send(count);
-                        let _ = decided_sender.send(state.decided_everything());
-                        minted
-                    }
-                };
-                if times_out && let Some(checkpoint) = &minted {
-                    timeouts.push_back((C::now(), checkpoint.anchor()));
-                }
-                // Attest to the minted checkpoint and submit concluded certificates through
-                // consensus: both ride this validator's own signed blocks. Failure is benign —
-                // the replica is shutting down, lost votes are resubmitted after replay, and
-                // certificates conclude again from them.
-                let payloads: Vec<_> = minted
-                    .map(Payload::Attest)
-                    .into_iter()
-                    .chain(
-                        state
-                            .certifier
-                            .take_certificates()
-                            .into_iter()
-                            .map(Payload::Certify),
-                    )
-                    .map(|payload| Self::wrap(now.as_millis() as u64, payload))
-                    .collect();
-                if !payloads.is_empty() && client.submit(payloads).await.is_err() {
-                    tracing::debug!("submission failed; shutting down");
-                }
-            }
-            (state.scheduler, state.certifier)
-        });
+        let (halted_sender, halted) = watch::channel(None);
+        let driver = Driver {
+            state,
+            receiver,
+            submitter: replica.transaction_client(),
+            metrics: metrics.clone(),
+            phase_one_timeout,
+            executed: executed_sender,
+            decided: decided_sender,
+            halted: halted_sender,
+        };
+        let driver = C::spawn(driver.run::<C>());
 
         Ok(ValidatorHandle {
             replica,
             driver,
             executed,
             decided,
+            halted,
             metrics,
             max_block_size,
         })
@@ -382,6 +313,167 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             replayed += executed as u64;
         }
         Ok(replayed)
+    }
+}
+
+/// Where the driver submits this validator's own votes and certificates.
+trait Submitter: Send + Sync + 'static {
+    /// Errors iff the replica shut down.
+    fn submit(
+        &self,
+        payloads: Vec<ConsensusTransaction>,
+    ) -> impl Future<Output = eyre::Result<()>> + Send;
+}
+
+impl Submitter for TransactionClient {
+    fn submit(
+        &self,
+        payloads: Vec<ConsensusTransaction>,
+    ) -> impl Future<Output = eyre::Result<()>> + Send {
+        TransactionClient::submit(self, payloads)
+    }
+}
+
+/// The task feeding the event stream to the execution state, once started.
+struct Driver<E, S> {
+    state: ExecutionState<E>,
+    receiver: mpsc::Receiver<DagEvent>,
+    submitter: S,
+    metrics: Arc<ValidatorMetrics>,
+    phase_one_timeout: Duration,
+    /// The executed transaction count, starting from the replayed ones.
+    executed: watch::Sender<u64>,
+    decided: watch::Sender<bool>,
+    halted: watch::Sender<Option<HaltReason>>,
+}
+
+impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
+    /// Runs until the event stream closes, then returns the scheduler and the certifier.
+    async fn run<C: Ctx>(self) -> (SequentialScheduler<E>, CheckpointCertifier) {
+        let Self {
+            mut state,
+            mut receiver,
+            submitter: client,
+            metrics: driver_metrics,
+            phase_one_timeout,
+            executed: executed_sender,
+            decided: decided_sender,
+            halted: halted_sender,
+        } = self;
+        let client_latency = driver_metrics.client_commit_latency_s().local();
+        let times_out = state.certifier.protocol().times_out();
+        // Re-attest checkpoints undecided at replay: votes in flight at shutdown died
+        // with the transaction queue, and a validator otherwise attests only once, so an
+        // undecided checkpoint could stall forever. The certifier's per-author dedupe
+        // makes resubmission idempotent — votes that did commit are simply ignored.
+        let pending: Vec<_> = state.certifier.pending().cloned().collect();
+        // Phase-one timeouts by mint instant, in mint order; replayed checkpoints time
+        // from now.
+        let mut timeouts = VecDeque::new();
+        if times_out {
+            timeouts.extend(
+                pending
+                    .iter()
+                    .map(|checkpoint| (C::now(), checkpoint.anchor())),
+            );
+        }
+        if !pending.is_empty() {
+            let timestamp_ms = C::timestamp_utc().as_millis() as u64;
+            let attestations = pending
+                .into_iter()
+                .map(|checkpoint| Self::wrap(timestamp_ms, Payload::Attest(checkpoint)))
+                .collect();
+            if client.submit(attestations).await.is_err() {
+                tracing::debug!("re-attestation failed; shutting down");
+            }
+        }
+
+        let mut count = *executed_sender.borrow();
+        // Armed for the earliest timeout; it may outlive it, waking once for nothing.
+        let mut timer = None;
+        loop {
+            if timer.is_none()
+                && let Some((minted, _)) = timeouts.front()
+            {
+                let remaining = phase_one_timeout.saturating_sub(C::elapsed(minted));
+                timer = Some(Box::pin(C::sleep(remaining)));
+            }
+            // Biased, so polling never depends on tokio's process-seeded RNG. Expired
+            // timeouts apply before every event either way, so the order is not observable.
+            let event = select! {
+                biased;
+                () = async { timer.as_mut().expect("guarded").await }, if timer.is_some() => {
+                    timer = None;
+                    None
+                }
+                event = receiver.recv() => match event {
+                    Some(event) => Some(event),
+                    None => break,
+                },
+            };
+            // Expired timeouts are checked on every event too: a busy stream must not
+            // starve them.
+            while let Some((minted, anchor)) = timeouts.front()
+                && C::elapsed(minted) >= phase_one_timeout
+            {
+                state.certifier.expire(*anchor);
+                timeouts.pop_front();
+            }
+            let now = C::timestamp_utc();
+            let minted = match event {
+                None => None,
+                Some(DagEvent::Block(block)) => {
+                    if state.count_arrivals(&driver_metrics, now, &block) {
+                        let _ = decided_sender.send(state.decided_everything());
+                    }
+                    None
+                }
+                Some(DagEvent::Commit(subdag)) => {
+                    // The clock starts at delivery (idle waiting is not latency) and stops
+                    // after execution, checkpoint minting, and vote recording.
+                    let start = C::now();
+                    let (executed, minted) =
+                        state.execute_subdag(&driver_metrics, &client_latency, now, subdag);
+                    driver_metrics.observe_subdag_execution_latency(C::elapsed(&start));
+                    count += executed as u64;
+                    let _ = executed_sender.send(count);
+                    let _ = decided_sender.send(state.decided_everything());
+                    minted
+                }
+            };
+            if times_out && let Some(checkpoint) = &minted {
+                timeouts.push_back((C::now(), checkpoint.anchor()));
+            }
+            if let Some(reason) = state.check_budget(&driver_metrics) {
+                tracing::error!(?reason, "validator halted: discarding events from now on");
+                driver_metrics.set_halted(reason.label());
+                let _ = halted_sender.send(Some(reason));
+                // Receive without executing, deciding or submitting, so that the replica never
+                // backs up behind a halted validator.
+                while receiver.recv().await.is_some() {}
+                break;
+            }
+            // Attest to the minted checkpoint and submit concluded certificates through
+            // consensus: both ride this validator's own signed blocks. Failure is benign —
+            // the replica is shutting down, lost votes are resubmitted after replay, and
+            // certificates conclude again from them.
+            let payloads: Vec<_> = minted
+                .map(Payload::Attest)
+                .into_iter()
+                .chain(
+                    state
+                        .certifier
+                        .take_certificates()
+                        .into_iter()
+                        .map(Payload::Certify),
+                )
+                .map(|payload| Self::wrap(now.as_millis() as u64, payload))
+                .collect();
+            if !payloads.is_empty() && client.submit(payloads).await.is_err() {
+                tracing::debug!("submission failed; shutting down");
+            }
+        }
+        (state.scheduler, state.certifier)
     }
 
     /// Wraps this validator's own payload, timestamped, for submission through consensus.
@@ -465,6 +557,9 @@ impl<E: ExecutionEngine> ExecutionState<E> {
             }
             checkpoint
         });
+        if minted.is_none() {
+            self.certifier.observe_unminted_commit(anchor);
+        }
         // A vote can never reference its own delivering sub-dag's checkpoint (it is created
         // only after that sub-dag commits), so recording after minting loses nothing.
         for (block, vote) in votes {
@@ -531,6 +626,14 @@ impl<E: ExecutionEngine> ExecutionState<E> {
         }
     }
 
+    /// The reason to halt, if the certifier retains more than the evidence budget; updates the
+    /// retained-bytes gauge.
+    fn check_budget(&self, metrics: &ValidatorMetrics) -> Option<HaltReason> {
+        let bytes = self.certifier.retained_bytes();
+        metrics.set_retained_bytes(bytes);
+        (bytes > self.evidence_budget).then_some(HaltReason::EvidenceBudget { bytes })
+    }
+
     /// Whether every minted checkpoint is decided, once one was minted; consumed by
     /// [`ValidatorHandle::wait_for_decided`].
     fn decided_everything(&self) -> bool {
@@ -548,6 +651,7 @@ pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
     driver: C::JoinHandle<(SequentialScheduler<E>, CheckpointCertifier)>,
     executed: watch::Receiver<u64>,
     decided: watch::Receiver<bool>,
+    halted: watch::Receiver<Option<HaltReason>>,
     metrics: Arc<ValidatorMetrics>,
     max_block_size: usize,
 }
@@ -582,6 +686,11 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
     /// The number of transactions executed so far.
     pub fn executed(&self) -> u64 {
         *self.executed.borrow()
+    }
+
+    /// Why the validator halted, if it did.
+    pub fn halted(&self) -> Option<HaltReason> {
+        *self.halted.borrow()
     }
 
     /// Starts the built-in load generator; its transactions share the replica's submission
@@ -644,31 +753,37 @@ mod tests {
     use std::{num::NonZeroU64, path::Path, sync::Arc, time::Duration};
 
     use checkpoint::{
-        certifier::CheckpointCertifier,
+        certifier::{CheckpointCertifier, CheckpointTimings},
         checkpoint::{Checkpoint, Decision, Outcome},
         finality::FinalityProtocol,
     };
     use dag::{
         authority::Authority,
-        block::{Block, data::Data, transaction::Transaction as ConsensusTransaction},
+        block::{
+            Block, BlockReference, data::Data, transaction::Transaction as ConsensusTransaction,
+        },
         config::ImportExport,
         consensus::CommittedSubDag,
+        context::TokioCtx,
         crypto::CryptoEngine,
+        output::DagEvent,
     };
     use execution::{
+        crypto::Digest,
         fake::{FakeExecutor, FakeTransaction},
         object::ObjectId,
         scheduler::SequentialScheduler,
     };
     use prometheus::Registry;
     use replica::config::{PrivateReplicaConfig, PublicReplicaConfig, ReplicaParameters};
+    use tokio::sync::{mpsc, watch};
 
     use crate::{
         envelope::{Envelope, Payload},
         fork::ForkInjection,
-        metrics::{FAST, FINALIZE, SKIP, SLOW, ValidatorMetrics},
+        metrics::{EVIDENCE_BUDGET, FAST, FINALIZE, SKIP, SLOW, ValidatorMetrics},
         parameters::ValidatorParameters,
-        validator::{ExecutionState, ValidatorBuilder},
+        validator::{Driver, ExecutionState, HaltReason, Submitter, ValidatorBuilder},
     };
 
     impl ExecutionState<FakeExecutor> {
@@ -691,8 +806,101 @@ mod tests {
             authority: Authority::new(0),
             fork: None,
             minted: 0,
+            evidence_budget: ValidatorParameters::default_evidence_budget_bytes(),
         }
     }
+
+    impl Submitter for mpsc::Sender<Vec<ConsensusTransaction>> {
+        async fn submit(&self, payloads: Vec<ConsensusTransaction>) -> eyre::Result<()> {
+            self.send(payloads)
+                .await
+                .map_err(|_| eyre::eyre!("submissions closed"))
+        }
+    }
+
+    /// A driver over an execution state, on tokio, fed through `events` and submitting into
+    /// `submitted`.
+    struct TestDriver {
+        events: mpsc::Sender<DagEvent>,
+        submitted: mpsc::Receiver<Vec<ConsensusTransaction>>,
+        halted: watch::Receiver<Option<HaltReason>>,
+        metrics: Arc<ValidatorMetrics>,
+        task: tokio::task::JoinHandle<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)>,
+    }
+
+    impl TestDriver {
+        /// The event channel's capacity: small, so that a driver that stops receiving blocks
+        /// its feeder at once.
+        const EVENTS: usize = 4;
+
+        fn spawn(state: ExecutionState<FakeExecutor>) -> Self {
+            let (events, receiver) = mpsc::channel(Self::EVENTS);
+            let (submitter, submitted) = mpsc::channel(1024);
+            let (halted_sender, halted) = watch::channel(None);
+            let metrics = metrics();
+            let driver = Driver {
+                state,
+                receiver,
+                submitter,
+                metrics: metrics.clone(),
+                phase_one_timeout: ValidatorParameters::default_phase_one_timeout(),
+                executed: watch::channel(0).0,
+                decided: watch::channel(false).0,
+                halted: halted_sender,
+            };
+            Self {
+                events,
+                submitted,
+                halted,
+                metrics,
+                task: tokio::spawn(driver.run::<TokioCtx>()),
+            }
+        }
+
+        /// Feeds `event`, failing if the driver does not take it within a second.
+        async fn feed(&self, event: DagEvent) {
+            let sent = tokio::time::timeout(Duration::from_secs(1), self.events.send(event));
+            let sent = sent.await.expect("the driver must keep receiving events");
+            sent.expect("the driver must be running");
+        }
+
+        /// Feeds a Byzantine author's early votes, round after round, with no commit, and
+        /// returns why the driver halted.
+        async fn halt_on_early_junk(&mut self) -> HaltReason {
+            for round in 2..200 {
+                self.feed(early_junk(round)).await;
+            }
+            let halted = self.halted.wait_for(Option::is_some);
+            let halted = tokio::time::timeout(Duration::from_secs(1), halted).await;
+            halted
+                .expect("the driver must halt")
+                .unwrap()
+                .expect("halted")
+        }
+    }
+
+    /// The vote of a validator that minted `anchor`.
+    fn vote_for(anchor: BlockReference) -> Checkpoint {
+        let mut twin =
+            CheckpointCertifier::new_for_test(FinalityProtocol::Baseline, vec![1; 4], 3, 0);
+        let (vote, _) = twin.push(anchor, Digest::default(), CheckpointTimings::default());
+        vote
+    }
+
+    /// A Byzantine author's block at `round`, voting for both leaders of the round before as
+    /// if they were committed: eligible as long as no commit passes that round.
+    fn early_junk(round: u64) -> DagEvent {
+        let votes = (0..2)
+            .map(|leader| {
+                let vote = vote_for(BlockReference::new_test(leader, round - 1));
+                Envelope::new(0, Payload::Attest(vote)).to_bytes()
+            })
+            .collect();
+        DagEvent::Block(block(3, round, votes))
+    }
+
+    /// The smallest evidence budget a validator accepts.
+    const SMALLEST_BUDGET: u64 = *ValidatorParameters::EVIDENCE_BUDGET_BYTES.start();
 
     /// Whether `decision` finalized `checkpoint`.
     fn finalizes(decision: &Decision, checkpoint: &Checkpoint) -> bool {
@@ -821,7 +1029,8 @@ mod tests {
         let mut diverged = Vec::new();
         for round in 1..=3 {
             // Sub-dags executing nothing mint nothing, so they do not count as heights.
-            state.execute(&metrics, Duration::ZERO, subdag(vec![vec![0xFF; 16]]));
+            let unminted = subdag_at(round, vec![(1, vec![vec![0xFF; 16]])]);
+            state.execute(&metrics, Duration::ZERO, unminted);
             let create = FakeTransaction::success(vec![], vec![ObjectId::new(round)], vec![]);
             let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
             let blocks = vec![(0, vec![execute])];
@@ -899,6 +1108,130 @@ mod tests {
             &[&[1], &[4]],
             "member 4 is not in the committee"
         ));
+    }
+
+    #[tokio::test]
+    async fn byzantine_early_votes_without_commits_halt_on_the_evidence_budget() {
+        let mut state = state(FinalityProtocol::SuiBaseline);
+        state.evidence_budget = SMALLEST_BUDGET;
+        let mut driver = TestDriver::spawn(state);
+
+        // No commit is processed, so the cursor never passes the junk: the budget bounds it.
+        let HaltReason::EvidenceBudget { bytes } = driver.halt_on_early_junk().await;
+        assert!(bytes > SMALLEST_BUDGET);
+        assert_eq!(driver.metrics.retained_bytes().get(), bytes as i64);
+        assert_eq!(driver.metrics.halted(EVIDENCE_BUDGET).get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_halted_validator_drains_events_without_deciding_or_submitting() {
+        let mut state = state(FinalityProtocol::SuiBaseline);
+        state.evidence_budget = SMALLEST_BUDGET;
+        let mut driver = TestDriver::spawn(state);
+        driver.halt_on_early_junk().await;
+
+        // Commits that would execute, mint and vote, and a quorum of votes for each, many
+        // times the event channel's capacity.
+        for round in 200..200 + 4 * TestDriver::EVENTS as u64 {
+            let commit = subdag_at(round, vec![(0, vec![creation(round)])]);
+            driver.feed(DagEvent::Commit(commit)).await;
+            let vote = Checkpoint::new_for_test(round);
+            for block in quorum_of_votes(round + 1, &vote) {
+                driver.feed(DagEvent::Block(block)).await;
+            }
+        }
+        let TestDriver {
+            events,
+            mut submitted,
+            metrics,
+            task,
+            ..
+        } = driver;
+        drop(events);
+        let (_, certifier) = task.await.unwrap();
+        assert_eq!(metrics.executed_transactions().get(), 0);
+        assert_eq!(certifier.pending().count(), 0);
+        assert_eq!(certifier.highest_decided(), None);
+        assert!(submitted.recv().await.is_none());
+    }
+
+    #[test]
+    fn evidence_budgets_outside_the_supported_range_are_rejected() {
+        let build = |evidence_budget_bytes| {
+            let private_config =
+                PrivateReplicaConfig::new_for_benchmarks(Path::new("unused"), 4).remove(0);
+            ValidatorBuilder::new(
+                FakeExecutor,
+                Authority::new(0),
+                PublicReplicaConfig::new_for_tests(4),
+                private_config,
+            )
+            .with_parameters(ValidatorParameters {
+                evidence_budget_bytes,
+                ..Default::default()
+            })
+            .build()
+        };
+        let rejected = |bytes| {
+            build(bytes).is_err_and(|error| error.to_string().contains("evidence_budget_bytes"))
+        };
+        assert!(rejected(1));
+        assert!(rejected(SMALLEST_BUDGET - 1));
+        assert!(build(SMALLEST_BUDGET).is_ok());
+        assert!(build(64 << 30).is_ok());
+        assert!(rejected((64 << 30) + 1));
+    }
+
+    #[test]
+    fn commits_executing_nothing_drop_the_arrivals_they_pass() {
+        let mut state = state(FinalityProtocol::SuiBaseline);
+        let metrics = metrics();
+        let vote = Envelope::new(0, Payload::Attest(Checkpoint::new_for_test(1))).to_bytes();
+        state.count_arrivals(&metrics, Duration::ZERO, &block(1, 3, vec![vote]));
+        assert_eq!(state.check_budget(&metrics), None);
+        assert!(metrics.retained_bytes().get() > 0);
+
+        // A commit of a later round with nothing to execute: the voted anchor never mints.
+        let unminted = subdag_at(2, vec![(1, vec![vec![0xFF; 16]])]);
+        state.execute(&metrics, Duration::ZERO, unminted);
+        assert_eq!(state.certifier.retained_bytes(), 0);
+        assert_eq!(state.check_budget(&metrics), None);
+        assert_eq!(metrics.retained_bytes().get(), 0);
+    }
+
+    #[test]
+    fn early_arrivals_are_held_for_as_many_anchors_per_round_as_consensus_has_leaders() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let consensus = "consensus:\n  protocol: mysticeti\n  leader_count: 3\n";
+        std::fs::write(file.path(), consensus).unwrap();
+        let replica_parameters = ReplicaParameters::load(file.path()).unwrap();
+        let public_config =
+            PublicReplicaConfig::new_for_tests(4).with_parameters(replica_parameters);
+        let private_config =
+            PrivateReplicaConfig::new_for_benchmarks(Path::new("unused"), 4).remove(0);
+        let validator = ValidatorBuilder::new(
+            FakeExecutor,
+            Authority::new(0),
+            public_config,
+            private_config,
+        )
+        .with_parameters(ValidatorParameters {
+            finality: FinalityProtocol::SuiBaseline,
+            ..Default::default()
+        })
+        .build()
+        .unwrap();
+
+        // One author votes for each of the three leaders of round 1: all are held.
+        let mut certifier = validator.state.certifier;
+        let mut retained = Vec::new();
+        for leader in 0..3 {
+            let vote = vote_for(BlockReference::new_test(leader, 1));
+            certifier.record_arrival(BlockReference::new_test(1, 3), vote);
+            retained.push(certifier.retained_bytes());
+        }
+        let one = retained[0];
+        assert_eq!(retained, [one, 2 * one, 3 * one]);
     }
 
     #[test]

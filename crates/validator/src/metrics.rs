@@ -12,11 +12,12 @@ use std::{
 
 use checkpoint::{certifier::CheckpointTimings, checkpoint::Outcome};
 use prometheus::{
-    Histogram, HistogramVec, IntCounter, IntGauge, Registry,
+    Histogram, HistogramVec, IntCounter, IntGauge, IntGaugeVec, Registry,
     core::{Collector, Desc},
     proto::{Counter, LabelPair, Metric, MetricFamily, MetricType},
     register_histogram_vec_with_registry, register_histogram_with_registry,
-    register_int_counter_with_registry, register_int_gauge_with_registry,
+    register_int_counter_with_registry, register_int_gauge_vec_with_registry,
+    register_int_gauge_with_registry,
 };
 
 // Metric names, public for scrapers. The counters are prefixed because the replica already
@@ -32,6 +33,8 @@ pub const END_TO_END_LATENCY_S: &str = "end_to_end_latency_s";
 pub const CHECKPOINT_FINALITY_LATENCY_S: &str = "checkpoint_finality_latency_s";
 pub const CHECKPOINT_PENDING_HEIGHTS: &str = "checkpoint_pending_heights";
 pub const CHECKPOINT_DECISION_ACCOUNTING: &str = "checkpoint_decision_accounting_total";
+pub const VALIDATOR_HALTED: &str = "validator_halted";
+pub const VALIDATOR_RETAINED_BYTES: &str = "validator_retained_bytes";
 
 /// The `outcome` label of [`CHECKPOINT_CERTIFICATION_LATENCY_S`] and
 /// [`CHECKPOINT_FINALITY_LATENCY_S`], and its values.
@@ -53,6 +56,11 @@ pub const LABEL_QUANTITY: &str = "quantity";
 pub const DECISIONS: &str = "decisions";
 pub const DECISION_LATENCY_S: &str = "latency_s";
 
+/// The `reason` label of [`VALIDATOR_HALTED`] and its values.
+pub const LABEL_REASON: &str = "reason";
+/// The retained state exceeded the evidence budget.
+pub const EVIDENCE_BUDGET: &str = "evidence_budget";
+
 /// Mysticeti's consensus-latency buckets: dense around the expected commit latency.
 const LATENCY_SEC_BUCKETS: &[f64] = &[
     0.1, 0.2, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1., 1.25, 1.5, 1.75, 2., 3.0, 5., 10.,
@@ -68,6 +76,8 @@ pub struct ValidatorMetrics {
     checkpoint_pending_heights: IntGauge,
     end_to_end_latency_s: Histogram,
     decision_accounting: DecisionAccounting,
+    halted: IntGaugeVec,
+    retained_bytes: IntGauge,
 }
 
 impl ValidatorMetrics {
@@ -76,6 +86,16 @@ impl ValidatorMetrics {
         registry
             .register(Box::new(decision_accounting.clone()))
             .unwrap();
+        let halted = register_int_gauge_vec_with_registry!(
+            VALIDATOR_HALTED,
+            "1 once the validator halted, by reason: it keeps running consensus, but executes, \
+                decides and submits nothing more",
+            &[LABEL_REASON],
+            registry,
+        )
+        .unwrap();
+        // Exported at 0 from the start, so that every run's measurements hold it.
+        halted.with_label_values(&[EVIDENCE_BUDGET]);
         Arc::new(Self {
             submitted_transactions: register_int_counter_with_registry!(
                 SUBMITTED_TRANSACTIONS,
@@ -135,6 +155,13 @@ impl ValidatorMetrics {
             )
             .unwrap(),
             decision_accounting,
+            halted,
+            retained_bytes: register_int_gauge_with_registry!(
+                VALIDATOR_RETAINED_BYTES,
+                "Bytes of state retained against the evidence budget",
+                registry,
+            )
+            .unwrap(),
         })
     }
 
@@ -195,6 +222,19 @@ impl ValidatorMetrics {
         self.checkpoint_pending_heights.set(pending as i64);
     }
 
+    /// Marks the validator halted for `reason`, a [`LABEL_REASON`] value.
+    pub(crate) fn set_halted(&self, reason: &str) {
+        self.halted.with_label_values(&[reason]).set(1);
+    }
+
+    /// Sets the retained-bytes gauge, if the value changed.
+    pub(crate) fn set_retained_bytes(&self, bytes: u64) {
+        let bytes = bytes as i64;
+        if self.retained_bytes.get() != bytes {
+            self.retained_bytes.set(bytes);
+        }
+    }
+
     /// The raw metrics, for test assertions (`get`/`get_sample_count`/`get_sample_sum`).
     pub fn submitted_transactions(&self) -> &IntCounter {
         &self.submitted_transactions
@@ -230,6 +270,15 @@ impl ValidatorMetrics {
 
     pub fn end_to_end_latency_s(&self) -> &Histogram {
         &self.end_to_end_latency_s
+    }
+
+    /// The halt gauge of one `reason` label.
+    pub fn halted(&self, reason: &str) -> IntGauge {
+        self.halted.with_label_values(&[reason])
+    }
+
+    pub fn retained_bytes(&self) -> &IntGauge {
+        &self.retained_bytes
     }
 
     /// The decision count and latency sum of one `outcome` and `path` label pair.

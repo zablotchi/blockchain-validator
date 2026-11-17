@@ -3,7 +3,7 @@
 
 //! The validator's knobs beyond the replica's.
 
-use std::time::Duration;
+use std::{ops::RangeInclusive, time::Duration};
 
 use checkpoint::finality::FinalityProtocol;
 use dag::config::ImportExport;
@@ -24,15 +24,27 @@ pub struct ValidatorParameters {
     #[serde(default = "ValidatorParameters::default_phase_one_timeout")]
     #[serde(with = "humantime_serde")]
     pub phase_one_timeout: Duration,
+    /// The bytes of state this validator may retain against Byzantine input (votes and
+    /// certificates held for anchors not processed yet) before it halts. It only halts this
+    /// node, so nodes may differ.
+    #[serde(default = "ValidatorParameters::default_evidence_budget_bytes")]
+    pub evidence_budget_bytes: u64,
 }
 
 impl ValidatorParameters {
     pub const DEFAULT_FILENAME: &'static str = "validator-parameters.yaml";
+    /// The accepted `evidence_budget_bytes`, from 4 KiB (for tests) to 64 GiB.
+    pub const EVIDENCE_BUDGET_BYTES: RangeInclusive<u64> = 4 << 10..=64 << 30;
 
     /// Mysticeti's round timeout for partially synchronous protocols
     /// (`Protocol::default_round_timeout`).
     pub fn default_phase_one_timeout() -> Duration {
         Duration::from_secs(1)
+    }
+
+    /// 1 GiB: far above fork-free use, far below an instance's memory.
+    pub fn default_evidence_budget_bytes() -> u64 {
+        1 << 30
     }
 }
 
@@ -42,6 +54,7 @@ impl Default for ValidatorParameters {
             finality: FinalityProtocol::default(),
             fork: None,
             phase_one_timeout: Self::default_phase_one_timeout(),
+            evidence_budget_bytes: Self::default_evidence_budget_bytes(),
         }
     }
 }
@@ -77,6 +90,7 @@ mod tests {
                 period: NonZeroU64::new(10).unwrap(),
             }),
             phase_one_timeout: Duration::from_millis(250),
+            evidence_budget_bytes: 1 << 30,
         };
         assert_eq!(loaded, expected);
     }

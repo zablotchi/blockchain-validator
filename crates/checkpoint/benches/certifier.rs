@@ -3,6 +3,8 @@
 
 //! Benchmarks the certifier's hot paths: minting pending checkpoints and tallying votes.
 
+use std::num::NonZeroUsize;
+
 use checkpoint::{
     certifier::{CheckpointCertifier, CheckpointTimings},
     checkpoint::Checkpoint,
@@ -16,6 +18,7 @@ const CHECKPOINTS: u64 = 100;
 const COMMITTEE_SIZE: usize = 4;
 /// Quorum for [`COMMITTEE_SIZE`] unit-stake validators: 2f + 1.
 const QUORUM: u64 = 3;
+const LEADERS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 /// Fails a bench built with the decision log, which workspace-wide builds turn on (through
 /// `validator`'s dev-dependencies): run `cargo bench -p checkpoint`.
@@ -34,7 +37,7 @@ fn mint(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let committee = Committee::new_test(vec![1; COMMITTEE_SIZE]);
-                CheckpointCertifier::new(committee, FinalityProtocol::Baseline, QUORUM)
+                CheckpointCertifier::new(committee, FinalityProtocol::Baseline, QUORUM, LEADERS)
             },
             |mut certifier| {
                 for n in 1..=CHECKPOINTS {

@@ -294,6 +294,14 @@ impl ProtocolMetrics for ValidatorProtocol {
                 kind: MetricKind::Gauge,
             },
             MetricSpec {
+                name: validator::metrics::VALIDATOR_HALTED.into(),
+                kind: MetricKind::Gauge,
+            },
+            MetricSpec {
+                name: validator::metrics::VALIDATOR_RETAINED_BYTES.into(),
+                kind: MetricKind::Gauge,
+            },
+            MetricSpec {
                 name: validator::metrics::SUBMITTED_TRANSACTIONS.into(),
                 kind: MetricKind::Counter,
             },

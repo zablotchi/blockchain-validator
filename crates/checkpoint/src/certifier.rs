@@ -5,6 +5,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    num::NonZeroUsize,
     sync::Arc,
     time::Duration,
 };
@@ -118,6 +119,37 @@ enum Arrival {
     Certificate(Certificate, BlockReference),
 }
 
+impl Arrival {
+    fn block(&self) -> BlockReference {
+        match self {
+            Self::Vote(_, block) | Self::Certificate(_, block) => *block,
+        }
+    }
+
+    /// The bytes holding it retains: the arrival, and a certificate's cited votes.
+    fn bytes(&self) -> u64 {
+        let cited = match self {
+            Self::Vote(..) => 0,
+            Self::Certificate(certificate, _) => certificate.votes().len(),
+        };
+        (size_of::<Self>() + cited * size_of::<BlockReference>()) as u64
+    }
+}
+
+/// The latest processed commit, minted or not: its anchor round, and the anchors processed at
+/// that round. Commits arrive in round order, so no anchor at or below it is processed again.
+#[derive(Default)]
+struct Cursor {
+    round: u64,
+    anchors: Vec<BlockReference>,
+}
+
+impl Cursor {
+    fn passed(&self, anchor: BlockReference) -> bool {
+        anchor.round < self.round || (anchor.round == self.round && self.anchors.contains(&anchor))
+    }
+}
+
 /// Timing constants carried from mint to decision, for the caller's latency metrics.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct CheckpointTimings {
@@ -169,8 +201,17 @@ pub struct CheckpointCertifier {
     pending: VecDeque<PendingCheckpoint>,
     /// The highest contiguously decided checkpoint; `None` until the first decision.
     watermark: Option<Decision>,
-    /// Arrivals for anchors not minted yet, in arrival order.
+    /// Leaders per consensus round: an honest author votes for at most this many anchors of
+    /// one round.
+    leaders: NonZeroUsize,
+    cursor: Cursor,
+    /// Arrivals for anchors not processed yet, in arrival order.
     early: BTreeMap<BlockReference, Vec<Arrival>>,
+    /// The distinct anchors of each round that each author's held arrivals are for, in
+    /// arrival order: at most `leaders`.
+    early_quota: BTreeMap<(u64, Authority), Vec<BlockReference>>,
+    /// The bytes `early` retains.
+    early_bytes: u64,
     /// Concluded certificates not yet taken for submission.
     certificates: Vec<Certificate>,
     /// Decided checkpoints the watermark passed since the last take, in commit order, with
@@ -183,16 +224,25 @@ pub struct CheckpointCertifier {
 }
 
 impl CheckpointCertifier {
-    /// A certifier deciding with `protocol`; `quorum` is the consensus protocol's quorum
-    /// threshold.
-    pub fn new(committee: Arc<Committee>, protocol: FinalityProtocol, quorum: Stake) -> Self {
+    /// A certifier deciding with `protocol`; `quorum` and `leaders` are the consensus
+    /// protocol's quorum threshold and leaders per round.
+    pub fn new(
+        committee: Arc<Committee>,
+        protocol: FinalityProtocol,
+        quorum: Stake,
+        leaders: NonZeroUsize,
+    ) -> Self {
         Self {
             thresholds: Thresholds::new(committee.total_stake(), quorum),
             committee,
             protocol,
             pending: VecDeque::new(),
             watermark: None,
+            leaders,
+            cursor: Cursor::default(),
             early: BTreeMap::new(),
+            early_quota: BTreeMap::new(),
+            early_bytes: 0,
             certificates: Vec::new(),
             contiguous: Vec::new(),
             #[cfg(any(test, feature = "decision-log"))]
@@ -215,13 +265,7 @@ impl CheckpointCertifier {
         commitment: Digest,
         timings: CheckpointTimings,
     ) -> (Checkpoint, Option<Outcome>) {
-        // Anchors are minted in commit order, so rounds never decrease: early arrivals for
-        // lower rounds are for anchors this validator never mints.
-        while let Some(entry) = self.early.first_entry()
-            && entry.key().round < anchor.round
-        {
-            entry.remove();
-        }
+        let held = self.advance_cursor(anchor);
         let local = Checkpoint::new(anchor, commitment);
         self.pending.push_back(PendingCheckpoint {
             local: local.clone(),
@@ -232,21 +276,28 @@ impl CheckpointCertifier {
             decision: None,
         });
         let index = self.pending.len() - 1;
-        let decided = self
-            .early
-            .remove(&anchor)
-            .into_iter()
-            .flatten()
-            .find_map(|arrival| match arrival {
-                Arrival::Vote(commitment, block) => self.arrive(index, commitment, block),
-                Arrival::Certificate(certificate, block) => {
-                    self.count_certificate(index, &certificate, block)
-                }
-            });
+        let decided = held.into_iter().find_map(|arrival| match arrival {
+            Arrival::Vote(commitment, block) => self.arrive(index, commitment, block),
+            Arrival::Certificate(certificate, block) => {
+                self.count_certificate(index, &certificate, block)
+            }
+        });
         if decided.is_some() {
             self.advance_watermark();
         }
         (local, decided.map(|(outcome, _)| outcome))
+    }
+
+    /// Moves past the commit anchored at `anchor`, which minted nothing (it executed nothing):
+    /// arrivals for it, or for anything it passes, are never held or counted.
+    pub fn observe_unminted_commit(&mut self, anchor: BlockReference) {
+        self.advance_cursor(anchor);
+    }
+
+    /// The bytes this certifier retains for recovery, against the caller's evidence budget:
+    /// the held early arrivals.
+    pub fn retained_bytes(&self) -> u64 {
+        self.early_bytes
     }
 
     /// This validator's checkpoints not yet contiguously decided, in commit order.
@@ -439,21 +490,63 @@ impl CheckpointCertifier {
             .map(|offset| start + offset)
     }
 
-    /// Holds an arrival for `anchor`, not minted yet, to count from its mint. Anchors below
-    /// the latest minted round never mint: their arrivals are dropped.
+    /// Moves the cursor to the processed commit anchored at `anchor`, dropping the arrivals and
+    /// quotas of the rounds it passes, and returns the arrivals held for `anchor`.
+    fn advance_cursor(&mut self, anchor: BlockReference) -> Vec<Arrival> {
+        if anchor.round > self.cursor.round {
+            self.cursor.round = anchor.round;
+            self.cursor.anchors.clear();
+            while let Some(entry) = self.early.first_entry()
+                && entry.key().round < anchor.round
+            {
+                self.early_bytes -= entry.remove().iter().map(Arrival::bytes).sum::<u64>();
+            }
+            while let Some(entry) = self.early_quota.first_entry()
+                && entry.key().0 < anchor.round
+            {
+                entry.remove();
+            }
+        }
+        debug_assert_eq!(
+            anchor.round, self.cursor.round,
+            "commits arrive in round order"
+        );
+        self.cursor.anchors.push(anchor);
+        let held = self.early.remove(&anchor).unwrap_or_default();
+        self.early_bytes -= held.iter().map(Arrival::bytes).sum::<u64>();
+        held
+    }
+
+    /// Holds an arrival for `anchor`, not processed yet, to count from its mint, if an honest
+    /// author could have sent it: honest authors vote only for anchors they committed, so from
+    /// blocks of later rounds, and for at most `leaders` anchors of one round, whichever of
+    /// their blocks carries the votes. Other arrivals are dropped.
     fn hold(&mut self, anchor: BlockReference, arrival: Arrival) {
-        let minted_round = self
-            .pending
-            .back()
-            .map_or(self.decided_round(), |entry| entry.round());
-        if anchor.round >= minted_round {
+        let block = arrival.block();
+        let eligible = !self.cursor.passed(anchor)
+            && anchor.round < block.round
+            && self.within_quota(anchor, block.authority);
+        if eligible {
+            self.early_bytes += arrival.bytes();
             self.early.entry(anchor).or_default().push(arrival);
         } else if anchor.round > self.decided_round() {
-            let author = match &arrival {
-                Arrival::Vote(_, block) | Arrival::Certificate(_, block) => block.authority,
-            };
+            let author = block.authority;
             tracing::warn!(%author, ?anchor, "checkpoint arrival for an unknown anchor");
         }
+    }
+
+    /// Whether `author` may have arrivals held for `anchor`: it already has, or has them held
+    /// for fewer than `leaders` anchors of that round, in which case `anchor` takes a place.
+    fn within_quota(&mut self, anchor: BlockReference, author: Authority) -> bool {
+        let anchors = self.early_quota.entry((anchor.round, author)).or_default();
+        if anchors.contains(&anchor) {
+            return true;
+        }
+        if anchors.len() == self.leaders.get() {
+            return false;
+        }
+        anchors.push(anchor);
+        true
     }
 
     /// Counts the vote `block` carries for the pending checkpoint at `index` as it arrives,
@@ -622,8 +715,8 @@ impl CheckpointCertifier {
         }
     }
 
-    /// A certifier over a [`Committee::new_test`] committee that already minted checkpoints
-    /// `1..=minted` matching [`Checkpoint::new_for_test`].
+    /// A certifier over a [`Committee::new_test`] committee with two leaders per round that
+    /// already minted checkpoints `1..=minted` matching [`Checkpoint::new_for_test`].
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(
         protocol: FinalityProtocol,
@@ -631,7 +724,8 @@ impl CheckpointCertifier {
         quorum: Stake,
         minted: u64,
     ) -> Self {
-        let mut certifier = Self::new(Committee::new_test(stake), protocol, quorum);
+        let leaders = NonZeroUsize::new(2).unwrap();
+        let mut certifier = Self::new(Committee::new_test(stake), protocol, quorum, leaders);
         for n in 1..=minted {
             let checkpoint = Checkpoint::new_for_test(n);
             certifier.push(
@@ -646,16 +740,19 @@ impl CheckpointCertifier {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{num::NonZeroUsize, time::Duration};
 
     use dag::{block::BlockReference, committee::Committee};
     use execution::crypto::Digest;
 
     use crate::{
-        certifier::{CheckpointCertifier, CheckpointTimings},
+        certifier::{Arrival, CheckpointCertifier, CheckpointTimings},
         checkpoint::{Certificate, Checkpoint, Decision, Outcome},
         finality::FinalityProtocol,
     };
+
+    /// Leaders per round, as in [`CheckpointCertifier::new_for_test`].
+    const LEADERS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
     /// Shorthand for [`Checkpoint::new_for_test`]: the vote for the `n`-th checkpoint.
     fn vote(n: u64) -> Checkpoint {
@@ -818,6 +915,7 @@ mod tests {
             Committee::new_test(vec![1; 4]),
             FinalityProtocol::Baseline,
             3,
+            LEADERS,
         );
         certifier.push(
             first().anchor(),
@@ -917,6 +1015,7 @@ mod tests {
             Committee::new_test(vec![1; 4]),
             FinalityProtocol::SuiBaseline,
             3,
+            LEADERS,
         );
         certifier.push(first, Digest::default(), CheckpointTimings::default());
         let vote = Checkpoint::new(second, Digest::default());
@@ -951,6 +1050,108 @@ mod tests {
             CheckpointTimings::default(),
         );
         assert!(certifier.early.is_empty());
+    }
+
+    #[test]
+    fn fabricated_early_arrivals_at_or_above_the_carrying_round_are_refused() {
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
+        let at = |round| Checkpoint::new(BlockReference::new_test(1, round), Digest::default());
+        let carrying = BlockReference::new_test(0, 5);
+
+        // An anchor of the carrying block's round or later is not committed when the block is
+        // created, so no honest author votes for it.
+        certifier.record_arrival(carrying, at(5));
+        certifier.record_arrival(carrying, at(1_000_000));
+        assert!(certifier.early.is_empty());
+        assert_eq!(certifier.retained_bytes(), 0);
+        certifier.record_arrival(carrying, at(4));
+        assert_eq!(certifier.early.len(), 1);
+    }
+
+    #[test]
+    fn early_arrivals_beyond_l_anchors_per_author_and_round_are_refused() {
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
+        let anchor = |author| BlockReference::new_test(author, 1);
+        let vote = |author| Checkpoint::new(anchor(author), Digest::default());
+
+        // A Byzantine author votes, from several of its blocks, for every anchor of round 1:
+        // only its first `LEADERS` anchors are held, each as often as it votes for them.
+        for (round, author) in [(5, 0), (6, 1), (6, 2), (7, 3), (7, 1)] {
+            certifier.record_arrival(BlockReference::new_test(3, round), vote(author));
+        }
+        let held = |author| certifier.early.get(&anchor(author)).map_or(0, Vec::len);
+        assert_eq!([0, 1, 2, 3].map(held), [1, 2, 0, 0]);
+
+        // Its junk uses up its own quota only: honest votes for another anchor of the round are
+        // held, and decide it at its mint.
+        for author in 0..3 {
+            certifier.record_arrival(block(author, 0), vote(2));
+        }
+        let (_, outcome) = certifier.push(anchor(2), Digest::default(), Default::default());
+        assert_eq!(outcome, Some(Outcome::Finalize(Digest::default())));
+    }
+
+    #[test]
+    fn commits_without_a_mint_advance_the_cursor_and_prune_lower_rounds() {
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
+        certifier.record_arrival(block(0, 0), vote(1));
+        certifier.record_arrival(block(0, 0), vote(2));
+        // Commits executing nothing, as when no application traffic flows.
+        let unminted = |round| BlockReference::new_test(1, round);
+
+        certifier.observe_unminted_commit(unminted(2));
+        // Another anchor of round 2 may still be processed.
+        let held: Vec<_> = certifier.early.keys().copied().collect();
+        assert_eq!(held, [vote(2).anchor()]);
+        certifier.observe_unminted_commit(unminted(3));
+        assert!(certifier.early.is_empty());
+        assert!(certifier.early_quota.is_empty());
+        assert_eq!(certifier.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn arrivals_for_a_processed_unminted_anchor_are_refused() {
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::SuiBaseline, vec![1; 4], 3, 0);
+        let unminted = BlockReference::new_test(1, 2);
+        certifier.observe_unminted_commit(unminted);
+
+        // Nothing mints it any more, nor an anchor of an earlier round.
+        certifier.record_arrival(block(0, 0), Checkpoint::new(unminted, Digest::default()));
+        certifier.record_arrival(block(0, 0), vote(1));
+        assert!(certifier.early.is_empty());
+        // Another anchor of its round still may, and a later one.
+        let same_round = Checkpoint::new(BlockReference::new_test(2, 2), Digest::default());
+        certifier.record_arrival(block(0, 0), same_round);
+        certifier.record_arrival(block(0, 0), vote(3));
+        assert_eq!(certifier.early.len(), 2);
+    }
+
+    #[test]
+    fn retained_bytes_track_held_arrivals_exactly() {
+        let vote_bytes = size_of::<Arrival>() as u64;
+        let certificate_bytes = vote_bytes + 3 * size_of::<BlockReference>() as u64;
+        let mut certifier =
+            CheckpointCertifier::new_for_test(FinalityProtocol::C, vec![1; 4], 3, 0);
+        certifier.record_arrival(block(0, 0), vote(1));
+        certifier.record_arrival(block(1, 0), vote(2));
+        let finalize = Outcome::Finalize(vote(2).commitment());
+        let cited = vec![block(0, 0), block(1, 0), block(2, 0)];
+        let phase_one = Certificate::new(vote(2).anchor(), finalize, cited);
+        certifier.record_arriving_certificate(carrier(0), phase_one);
+        assert_eq!(
+            certifier.retained_bytes(),
+            2 * vote_bytes + certificate_bytes
+        );
+
+        // The mint consumes its arrivals, and the cursor drops those it passes.
+        certifier.push(vote(1).anchor(), Digest::default(), Default::default());
+        assert_eq!(certifier.retained_bytes(), vote_bytes + certificate_bytes);
+        certifier.observe_unminted_commit(BlockReference::new_test(1, 3));
+        assert_eq!(certifier.retained_bytes(), 0);
     }
 
     #[test]
