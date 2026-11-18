@@ -67,6 +67,8 @@ pub const LABEL_REASON: &str = "reason";
 pub const EVIDENCE_BUDGET: &str = "evidence_budget";
 /// The state diverged from the canonical one.
 pub const DIVERGENCE: &str = "divergence";
+/// The executed heights not yet released reached the window cap.
+pub const UNSTABLE_HEIGHTS: &str = "unstable_heights";
 
 /// Mysticeti's consensus-latency buckets: dense around the expected commit latency.
 const LATENCY_SEC_BUCKETS: &[f64] = &[

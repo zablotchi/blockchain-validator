@@ -34,6 +34,10 @@ pub struct ValidatorParameters {
     /// for own proposals. It only paces this node, so nodes may differ.
     #[serde(default = "ValidatorParameters::default_protocol_bytes_in_flight")]
     pub protocol_bytes_in_flight: u64,
+    /// The executed heights not yet released this validator may keep, to undo them in a
+    /// recovery, before it halts. It only halts this node, so nodes may differ.
+    #[serde(default = "ValidatorParameters::default_max_unstable_heights")]
+    pub max_unstable_heights: u32,
 }
 
 impl ValidatorParameters {
@@ -43,6 +47,8 @@ impl ValidatorParameters {
     /// The largest accepted `protocol_bytes_in_flight`; the smallest is the largest protocol
     /// payload ([`max_protocol_payload`](crate::limits::max_protocol_payload)).
     pub const MAX_PROTOCOL_BYTES_IN_FLIGHT: u64 = 4 << 20;
+    /// The accepted `max_unstable_heights`.
+    pub const MAX_UNSTABLE_HEIGHTS: RangeInclusive<u32> = 8..=16_384;
 
     /// Mysticeti's round timeout for partially synchronous protocols
     /// (`Protocol::default_round_timeout`).
@@ -59,6 +65,12 @@ impl ValidatorParameters {
     pub fn default_protocol_bytes_in_flight() -> u64 {
         1 << 20
     }
+
+    /// About 80 s of heights at the 12.8 per second measured on AWS, where fork-free runs keep
+    /// at most a handful.
+    pub fn default_max_unstable_heights() -> u32 {
+        1024
+    }
 }
 
 impl Default for ValidatorParameters {
@@ -69,6 +81,7 @@ impl Default for ValidatorParameters {
             phase_one_timeout: Self::default_phase_one_timeout(),
             evidence_budget_bytes: Self::default_evidence_budget_bytes(),
             protocol_bytes_in_flight: Self::default_protocol_bytes_in_flight(),
+            max_unstable_heights: Self::default_max_unstable_heights(),
         }
     }
 }
@@ -106,6 +119,7 @@ mod tests {
             phase_one_timeout: Duration::from_millis(250),
             evidence_budget_bytes: 1 << 30,
             protocol_bytes_in_flight: 1 << 20,
+            max_unstable_heights: 1024,
         };
         assert_eq!(loaded, expected);
     }

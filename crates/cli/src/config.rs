@@ -90,7 +90,7 @@ mod tests {
         enable_synchronizer: false\n  fsync: true\n";
     const VALIDATOR: &str = "finality: c\nfork:\n  groups: [[1], [2, 3]]\n  period: 5\n\
         phase_one_timeout: 250ms\nevidence_budget_bytes: 1048576\n\
-        protocol_bytes_in_flight: 2097152\n";
+        protocol_bytes_in_flight: 2097152\nmax_unstable_heights: 64\n";
     const LOAD_GENERATOR: &str = "load: 10\ntransaction_size: 512\ninitial_delay: 10s\n";
 
     fn load_yaml<T: RoundTrip>(yaml: &str) -> eyre::Result<T> {
@@ -157,6 +157,8 @@ mod tests {
         rejects::<ValidatorParameters>(budget, "evidence_budget_bytes_typo");
         let in_flight = "protocol_bytes_in_flight_typo: 4096\n";
         rejects::<ValidatorParameters>(in_flight, "protocol_bytes_in_flight_typo");
+        let window = "max_unstable_heights_typo: 64\n";
+        rejects::<ValidatorParameters>(window, "max_unstable_heights_typo");
         let fork = "fork:\n  groups: [[1]]\n  period: 5\n  period_typo: 3\n";
         rejects::<ValidatorParameters>(fork, "fork.period_typo");
 

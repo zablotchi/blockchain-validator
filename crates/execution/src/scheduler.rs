@@ -45,6 +45,10 @@ impl<E: ExecutionEngine> SequentialScheduler<E> {
     pub fn store(&self) -> &InMemoryStore {
         &self.store
     }
+
+    pub fn store_mut(&mut self) -> &mut InMemoryStore {
+        &mut self.store
+    }
 }
 
 #[cfg(test)]

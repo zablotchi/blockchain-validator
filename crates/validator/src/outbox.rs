@@ -21,6 +21,8 @@ use crate::{envelope::Envelope, limits::framed_size};
 pub(crate) struct ProtocolOutbox {
     authority: Authority,
     queue: VecDeque<ConsensusTransaction>,
+    /// Framed bytes of `queue`.
+    queued: u64,
     /// Framed bytes submitted and not yet seen in an own proposal.
     outstanding: u64,
     budget: u64,
@@ -31,6 +33,7 @@ impl ProtocolOutbox {
         Self {
             authority,
             queue: VecDeque::new(),
+            queued: 0,
             outstanding: 0,
             budget,
         }
@@ -38,6 +41,7 @@ impl ProtocolOutbox {
 
     /// Queues one event's payloads behind those already queued.
     pub(crate) fn enqueue(&mut self, payloads: Vec<ConsensusTransaction>) {
+        self.queued += payloads.iter().map(framed_size).sum::<u64>();
         self.queue.extend(payloads);
     }
 
@@ -52,6 +56,7 @@ impl ProtocolOutbox {
                 break;
             }
             self.outstanding += bytes;
+            self.queued -= bytes;
             batch.extend(self.queue.pop_front());
         }
         batch
@@ -60,6 +65,11 @@ impl ProtocolOutbox {
     /// Whether payloads wait for the budget.
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    /// The framed bytes of the payloads waiting for the budget.
+    pub(crate) fn queued_bytes(&self) -> u64 {
+        self.queued
     }
 
     /// Releases the protocol payloads of `block` if this validator authored it, and returns
@@ -149,13 +159,16 @@ mod tests {
         };
 
         outbox.enqueue(vec![vote(1), vote(2), vote(3)]);
+        assert_eq!(outbox.queued_bytes(), 3 * vote_bytes());
         assert_eq!(submit(&mut outbox), 2);
         assert_eq!(submit(&mut outbox), 0);
         assert!(!outbox.is_empty());
+        assert_eq!(outbox.queued_bytes(), vote_bytes());
         // An own block carrying the first vote makes room for the third.
         outbox.observe_block(&block(0, vec![vote(1)]));
         assert_eq!(submit(&mut outbox), 1);
         assert!(outbox.is_empty());
+        assert_eq!(outbox.queued_bytes(), 0);
         outbox.enqueue(vec![vote(4)]);
         assert_eq!(submit(&mut outbox), 0);
         outbox.observe_block(&block(0, vec![vote(2), vote(3)]));

@@ -47,7 +47,7 @@ use crate::{
     envelope::{Envelope, Payload},
     fork::ForkInjection,
     limits::{self, CLIENT_BATCH_BYTES, split_batch},
-    metrics::{DIVERGENCE, EVIDENCE_BUDGET, FAST, SLOW, ValidatorMetrics},
+    metrics::{DIVERGENCE, EVIDENCE_BUDGET, FAST, SLOW, UNSTABLE_HEIGHTS, ValidatorMetrics},
     outbox::ProtocolOutbox,
     parameters::ValidatorParameters,
 };
@@ -145,6 +145,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             phase_one_timeout,
             evidence_budget_bytes,
             protocol_bytes_in_flight,
+            max_unstable_heights,
         } = self.parameters;
         eyre::ensure!(
             !finality.needs_bft_quorum() || quorum == 2 * committee.total_stake() / 3 + 1,
@@ -160,6 +161,10 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
                 .contains(&protocol_bytes_in_flight),
             "protocol_bytes_in_flight must be between {largest_payload} (the largest protocol \
                 payload) and 4 MiB, not {protocol_bytes_in_flight}"
+        );
+        eyre::ensure!(
+            ValidatorParameters::MAX_UNSTABLE_HEIGHTS.contains(&max_unstable_heights),
+            "max_unstable_heights must be between 8 and 16384, not {max_unstable_heights}"
         );
         if let Some(fork) = &fork {
             let mut members = HashSet::new();
@@ -184,16 +189,21 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
         if fork.is_some() {
             certifier = certifier.with_emulated_forks();
         }
+        let mut scheduler = SequentialScheduler::new(self.engine);
+        scheduler.store_mut().enable_journal(1);
         Ok(Validator {
             state: ExecutionState {
-                scheduler: SequentialScheduler::new(self.engine),
+                scheduler,
                 certifier,
                 authority: self.authority,
                 fork,
                 minted: 0,
                 last_commitment: Digest::default(),
                 timeouts: VecDeque::new(),
-                divergence: None,
+                kept: VecDeque::new(),
+                kept_bytes: 0,
+                max_unstable_heights: max_unstable_heights as usize,
+                halt: None,
                 evidence_budget: evidence_budget_bytes,
             },
             authority: self.authority,
@@ -239,18 +249,45 @@ struct ExecutionState<E> {
     /// C's phase-one timeouts in deadline order, one per pending checkpoint: the driver's clock
     /// at mint (its time since start), the anchor and the generation it was minted at.
     timeouts: VecDeque<(Duration, BlockReference, u32)>,
-    /// The released checkpoint where this validator's state diverged, if any.
-    divergence: Option<Divergence>,
-    /// The bytes the certifier may retain before the validator halts.
+    /// The executed heights not yet released, one per pending checkpoint and in the same order,
+    /// with the store's journal of each: what a recovery undoes and executes again.
+    kept: VecDeque<KeptHeight>,
+    /// The bytes the kept transactions hold.
+    kept_bytes: u64,
+    /// The most heights `kept` may hold: executing one more halts the validator.
+    max_unstable_heights: usize,
+    /// Why the validator must halt, once it must.
+    halt: Option<HaltReason>,
+    /// The bytes the validator may retain before it halts.
     evidence_budget: u64,
+}
+
+/// An executed height not yet released.
+struct KeptHeight {
+    anchor: BlockReference,
+    height: u64,
+    transactions: Vec<Transaction>,
+}
+
+impl KeptHeight {
+    fn bytes(&self) -> u64 {
+        let bytes: usize = self
+            .transactions
+            .iter()
+            .map(Transaction::memory_bytes)
+            .sum();
+        bytes as u64
+    }
 }
 
 /// Why a validator halted: it keeps running consensus, so the replica never backs up and the
 /// run completes, but it executes, decides and submits nothing more.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HaltReason {
-    /// The certifier retained more than the evidence budget.
+    /// The validator retained more than the evidence budget.
     EvidenceBudget { bytes: u64 },
+    /// As many executed heights as the window allows are not released yet.
+    UnstableHeights { heights: usize },
     /// The state diverged from the canonical one at the checkpoint anchored at `anchor`, and
     /// this validator cannot recover yet.
     Divergence { anchor: BlockReference },
@@ -261,6 +298,7 @@ impl HaltReason {
     fn label(self) -> &'static str {
         match self {
             Self::EvidenceBudget { .. } => EVIDENCE_BUDGET,
+            Self::UnstableHeights { .. } => UNSTABLE_HEIGHTS,
             Self::Divergence { .. } => DIVERGENCE,
         }
     }
@@ -484,7 +522,7 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
             if times_out && let Some(checkpoint) = &minted {
                 state.arm_timeout(C::elapsed(&epoch), checkpoint.anchor());
             }
-            if let Some(reason) = state.halt_reason(&driver_metrics) {
+            if let Some(reason) = state.halt_reason(&driver_metrics, outbox.queued_bytes()) {
                 tracing::error!(?reason, "validator halted: discarding events from now on");
                 driver_metrics.set_halted(reason.label());
                 let _ = halted_sender.send(Some(reason));
@@ -592,7 +630,19 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 carried.push((*block.reference(), items));
             }
         }
-        let executed = self.scheduler.execute(&transactions).len();
+        let executed = transactions.len();
+        if executed > 0 {
+            if self.kept.len() >= self.max_unstable_heights {
+                // Nothing of this sub-dag is executed or observed.
+                client_latency.clear();
+                let heights = self.kept.len();
+                self.halt
+                    .get_or_insert(HaltReason::UnstableHeights { heights });
+                return (0, None);
+            }
+            self.scheduler.store_mut().begin_height(self.minted + 1);
+            self.scheduler.execute(&transactions);
+        }
         metrics.inc_executed_transactions(executed as u64);
         client_latency.flush();
         let minted = (executed > 0).then(|| {
@@ -614,6 +664,13 @@ impl<E: ExecutionEngine> ExecutionState<E> {
             self.last_commitment = commitment;
             // Arrivals held for the mint may conclude it; it is released with the rest below.
             let (checkpoint, _) = self.certifier.push(anchor, commitment, parent, timings);
+            let kept = KeptHeight {
+                anchor,
+                height: self.minted,
+                transactions,
+            };
+            self.kept_bytes += kept.bytes();
+            self.kept.push_back(kept);
             checkpoint
         });
         if minted.is_none() {
@@ -659,12 +716,13 @@ impl<E: ExecutionEngine> ExecutionState<E> {
 
     /// Releases what the certifier allows and closes each released checkpoint's metrics once, at
     /// `now`: certification latency and the decision accounting on the path that concluded it,
-    /// finality, and end-to-end if it finalized. Drops the released checkpoints' timeouts,
-    /// updates the pending gauge, and keeps a divergence, which halts this validator. Returns
-    /// whether a checkpoint was released.
+    /// finality, and end-to-end if it finalized. Drops the released heights' timeouts, kept
+    /// transactions and, unless they diverged, journals; updates the pending gauge, and keeps a
+    /// divergence, which halts this validator. Returns whether a checkpoint was released.
     fn settle(&mut self, metrics: &ValidatorMetrics, now: Duration) -> bool {
         self.certifier.release();
-        let mut released = false;
+        // The highest released height.
+        let mut released = None;
         for Released {
             outcome,
             timings,
@@ -681,19 +739,32 @@ impl<E: ExecutionEngine> ExecutionState<E> {
             if waited {
                 metrics.inc_release_waits();
             }
-            released = true;
+            let kept = self.kept.pop_front().expect("every pending height is kept");
+            self.kept_bytes -= kept.bytes();
+            released = Some(kept.height);
         }
-        if released {
+        if released.is_some() {
             let certifier = &self.certifier;
             self.timeouts.retain(|&(_, anchor, generation)| {
                 certifier.generation(anchor) == Some(generation)
             });
         }
         metrics.set_pending_heights(self.certifier.pending().len());
-        if let Some(divergence) = self.certifier.take_divergence() {
-            self.divergence.get_or_insert(divergence);
+        let mut stable = released;
+        if let Some(Divergence { anchor, .. }) = self.certifier.take_divergence() {
+            // The last released height diverged: its journal is kept, to undo it.
+            stable = released.map(|height| height - 1);
+            self.halt.get_or_insert(HaltReason::Divergence { anchor });
         }
-        released
+        if let Some(height) = stable {
+            self.scheduler.store_mut().prune_through(height);
+        }
+        debug_assert!(
+            (self.kept.iter().map(|kept| kept.anchor))
+                .eq(self.certifier.pending().map(Checkpoint::anchor)),
+            "kept heights align with pending checkpoints"
+        );
+        released.is_some()
     }
 
     /// Arms C's phase-one timeout of the checkpoint minted at `anchor`, at `minted` on the
@@ -704,15 +775,15 @@ impl<E: ExecutionEngine> ExecutionState<E> {
         }
     }
 
-    /// The reason to halt, if the state diverged or the certifier retains more than the
-    /// evidence budget; updates the retained-bytes gauge.
-    fn halt_reason(&self, metrics: &ValidatorMetrics) -> Option<HaltReason> {
-        let bytes = self.certifier.retained_bytes();
+    /// The reason to halt, if one arose or the validator retains more than the evidence
+    /// budget: the certifier's state, the kept transactions, the store's journal and the
+    /// `queued` bytes of own payloads waiting to be submitted. Updates the retained-bytes gauge.
+    fn halt_reason(&self, metrics: &ValidatorMetrics, queued: u64) -> Option<HaltReason> {
+        let journal = self.scheduler.store().journal_bytes() as u64;
+        let bytes = self.certifier.retained_bytes() + self.kept_bytes + journal + queued;
         metrics.set_retained_bytes(bytes);
-        if let Some(Divergence { anchor, .. }) = self.divergence {
-            return Some(HaltReason::Divergence { anchor });
-        }
-        (bytes > self.evidence_budget).then_some(HaltReason::EvidenceBudget { bytes })
+        self.halt
+            .or((bytes > self.evidence_budget).then_some(HaltReason::EvidenceBudget { bytes }))
     }
 
     /// Whether every minted checkpoint is decided, once one was minted; consumed by
@@ -859,7 +930,7 @@ mod tests {
 
     use checkpoint::{
         certifier::{CheckpointCertifier, CheckpointTimings},
-        checkpoint::{Checkpoint, Decision, Outcome},
+        checkpoint::{Certificate, Checkpoint, Decision, Outcome},
         finality::FinalityProtocol,
     };
     use dag::{
@@ -878,6 +949,7 @@ mod tests {
         fake::{FakeExecutor, FakeTransaction},
         object::ObjectId,
         scheduler::SequentialScheduler,
+        store::StateView,
         transaction::Transaction,
     };
     use prometheus::Registry;
@@ -888,7 +960,10 @@ mod tests {
         envelope::{Envelope, Payload},
         fork::ForkInjection,
         limits::{self, CLIENT_BATCH_BYTES, framed_size},
-        metrics::{DIVERGENCE, EVIDENCE_BUDGET, FAST, FINALIZE, SKIP, SLOW, ValidatorMetrics},
+        metrics::{
+            DIVERGENCE, EVIDENCE_BUDGET, FAST, FINALIZE, SKIP, SLOW, UNSTABLE_HEIGHTS,
+            ValidatorMetrics,
+        },
         outbox::ProtocolOutbox,
         parameters::ValidatorParameters,
         validator::{
@@ -910,15 +985,20 @@ mod tests {
     }
 
     fn state(protocol: FinalityProtocol) -> ExecutionState<FakeExecutor> {
+        let mut scheduler = SequentialScheduler::new(FakeExecutor);
+        scheduler.store_mut().enable_journal(1);
         ExecutionState {
-            scheduler: SequentialScheduler::new(FakeExecutor),
+            scheduler,
             certifier: CheckpointCertifier::new_for_test(protocol, vec![1; 4], 3, 0),
             authority: Authority::new(0),
             fork: None,
             minted: 0,
             last_commitment: Digest::default(),
             timeouts: VecDeque::new(),
-            divergence: None,
+            kept: VecDeque::new(),
+            kept_bytes: 0,
+            max_unstable_heights: ValidatorParameters::default_max_unstable_heights() as usize,
+            halt: None,
             evidence_budget: ValidatorParameters::default_evidence_budget_bytes(),
         }
     }
@@ -985,12 +1065,36 @@ mod tests {
             for round in 2..200 {
                 self.feed(early_junk(round)).await;
             }
+            self.halted().await
+        }
+
+        /// Why the driver halted, failing if it does not within a second.
+        async fn halted(&mut self) -> HaltReason {
             let halted = self.halted.wait_for(Option::is_some);
             let halted = tokio::time::timeout(Duration::from_secs(1), halted).await;
             halted
                 .expect("the driver must halt")
                 .unwrap()
                 .expect("halted")
+        }
+
+        /// Closes the event stream and returns what the driver submitted and its final state.
+        async fn finish(
+            self,
+        ) -> (
+            mpsc::Receiver<Vec<ConsensusTransaction>>,
+            SequentialScheduler<FakeExecutor>,
+            CheckpointCertifier,
+        ) {
+            let Self {
+                events,
+                submitted,
+                task,
+                ..
+            } = self;
+            drop(events);
+            let (scheduler, certifier) = task.await.unwrap();
+            (submitted, scheduler, certifier)
         }
     }
 
@@ -1430,6 +1534,154 @@ mod tests {
         create(vec![0; size - overhead])
     }
 
+    /// A quorum of committed votes for `checkpoint`, in a sub-dag at `round`.
+    fn committed_votes(round: u64, checkpoint: &Checkpoint) -> CommittedSubDag {
+        let vote = Envelope::new(0, Payload::Attest(checkpoint.clone())).to_bytes();
+        let blocks = (0..3).map(|author| (author, vec![vote.clone()])).collect();
+        subdag_at(round, blocks)
+    }
+
+    /// The transaction [`creation`] wraps.
+    fn creation_transaction(id: u64) -> Transaction {
+        FakeTransaction::success(vec![], vec![ObjectId::new(id)], vec![]).into()
+    }
+
+    #[test]
+    fn kept_heights_and_journals_are_pruned_as_they_are_released() {
+        let mut state = state(FinalityProtocol::Baseline);
+        state.max_unstable_heights = 3;
+        let metrics = metrics();
+        let mint = |state: &mut ExecutionState<FakeExecutor>, round| {
+            let commit = subdag_at(round, vec![(0, vec![creation(round)])]);
+            let (_, minted) = state.execute(&metrics, Duration::ZERO, commit);
+            minted.expect("executing sub-dag must mint a checkpoint")
+        };
+        let mut checkpoints: Vec<_> = (1..=3).map(|round| mint(&mut state, round)).collect();
+        let kept = |state: &ExecutionState<FakeExecutor>| {
+            assert_eq!(state.halt, None);
+            let heights: Vec<_> = state.kept.iter().map(|kept| kept.height).collect();
+            let journal = state.scheduler.store().journal_bytes() as u64;
+            (heights, state.kept_bytes, journal)
+        };
+        // Each height creates one object.
+        let (heights, transactions, journal) = kept(&state);
+        assert_eq!(heights, [1, 2, 3]);
+        let transaction = creation_transaction(1).memory_bytes() as u64;
+        assert_eq!(transactions, 3 * transaction);
+        let height = journal / 3;
+
+        // At the window cap, releasing a height makes room for the next.
+        let votes = committed_votes(4, &checkpoints[0]);
+        state.execute(&metrics, Duration::ZERO, votes);
+        assert_eq!(kept(&state), (vec![2, 3], 2 * transaction, 2 * height));
+        checkpoints.push(mint(&mut state, 5));
+        assert_eq!(kept(&state), (vec![2, 3, 4], 3 * transaction, 3 * height));
+        for (round, checkpoint) in (6..).zip(&checkpoints[1..]) {
+            state.execute(&metrics, Duration::ZERO, committed_votes(round, checkpoint));
+        }
+        assert_eq!(kept(&state), (vec![], 0, 0));
+        assert_eq!(state.certifier.pending().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reaching_the_window_cap_halts_with_its_error() {
+        let parameters = ValidatorParameters {
+            max_unstable_heights: 8,
+            ..Default::default()
+        };
+        let state = builder(parameters).build().unwrap().state;
+        let mut driver = TestDriver::spawn(state, DEFAULT_IN_FLIGHT);
+        // No height is decided: the ninth would exceed the window.
+        for round in 1..=9 {
+            let commit = subdag_at(round, vec![(0, vec![creation(round)])]);
+            driver.feed(DagEvent::Commit(commit)).await;
+        }
+
+        let reason = driver.halted().await;
+        assert_eq!(reason, HaltReason::UnstableHeights { heights: 8 });
+        assert_eq!(driver.metrics.halted(UNSTABLE_HEIGHTS).get(), 1);
+        let metrics = driver.metrics.clone();
+        let (_, scheduler, certifier) = driver.finish().await;
+        // The ninth sub-dag was neither executed nor observed.
+        assert_eq!(certifier.pending().count(), 8);
+        assert_eq!(metrics.executed_transactions().get(), 8);
+        assert_eq!(metrics.client_commit_latency_s().get_sample_count(), 8);
+        assert!(scheduler.store().latest(&ObjectId::new(9)).is_none());
+    }
+
+    #[test]
+    fn kept_state_counts_only_execute_transactions() {
+        let mut state = state(FinalityProtocol::Baseline);
+        let metrics = metrics();
+        let vote = Envelope::new(0, Payload::Attest(Checkpoint::new_for_test(7))).to_bytes();
+        let anchor = Checkpoint::new_for_test(7).anchor();
+        let votes = (0..3)
+            .map(|author| BlockReference::new_test(author, 8))
+            .collect();
+        let certificate = Certificate::new(anchor, Digest::default(), Outcome::Skip, votes);
+        let certificate = Envelope::new(0, Payload::Certify(certificate)).to_bytes();
+        let payloads = vec![
+            creation(1),
+            vote,
+            certificate,
+            vec![0xFF; 16 << 10],
+            creation(2),
+        ];
+
+        state.execute(&metrics, Duration::ZERO, subdag(payloads));
+
+        assert_eq!(state.halt_reason(&metrics, 0), None);
+        let transactions: usize = [1, 2]
+            .map(|id| creation_transaction(id).memory_bytes())
+            .iter()
+            .sum();
+        let journal = state.scheduler.store().journal_bytes();
+        assert!(journal > 0);
+        let retained = metrics.retained_bytes().get() as usize;
+        assert_eq!(retained, transactions + journal);
+    }
+
+    #[tokio::test]
+    async fn queued_own_payloads_count_against_the_evidence_budget() {
+        // Room for one vote in flight (votes are of fixed size).
+        let vote = Envelope::new(0, Payload::Attest(Checkpoint::new_for_test(1))).to_bytes();
+        let vote_bytes = framed_size(&ConsensusTransaction::new(vote.into()));
+        let driver = TestDriver::spawn(state(FinalityProtocol::Baseline), vote_bytes);
+        for round in 1..=5 {
+            let commit = subdag_at(round, vec![(0, vec![creation(round)])]);
+            driver.feed(DagEvent::Commit(commit)).await;
+        }
+        // Any later event measures the four votes waiting behind the first.
+        driver.feed(DagEvent::Block(block(1, 6, vec![]))).await;
+
+        let metrics = driver.metrics.clone();
+        let (_, scheduler, _) = driver.finish().await;
+        let transactions: usize = (1..=5)
+            .map(|id| creation_transaction(id).memory_bytes())
+            .sum();
+        let journal = scheduler.store().journal_bytes();
+        let expected = transactions + journal + 4 * vote_bytes as usize;
+        assert_eq!(metrics.retained_bytes().get() as usize, expected);
+    }
+
+    #[test]
+    fn max_unstable_heights_outside_the_supported_range_are_rejected() {
+        let build = |max_unstable_heights| {
+            builder(ValidatorParameters {
+                max_unstable_heights,
+                ..Default::default()
+            })
+            .build()
+        };
+        let rejected = |heights| {
+            build(heights).is_err_and(|error| error.to_string().contains("max_unstable_heights"))
+        };
+        assert!(rejected(7));
+        assert!(build(8).is_ok());
+        assert!(build(16_384).is_ok());
+        assert!(rejected(16_385));
+    }
+
     #[test]
     fn client_submissions_above_the_ceiling_are_rejected() {
         let ceiling = limits::max_transaction_size(1 << 20);
@@ -1488,14 +1740,11 @@ mod tests {
         let votes = subdag_at(2, vec![(1, vec![vote.clone()]), (2, vec![vote])]);
         driver.feed(DagEvent::Commit(votes)).await;
 
-        let halted = driver.halted.wait_for(Option::is_some);
-        let halted = tokio::time::timeout(Duration::from_secs(1), halted).await;
-        let reason = halted
-            .expect("the driver must halt")
-            .unwrap()
-            .expect("halted");
-        assert_eq!(reason, HaltReason::Divergence { anchor });
+        assert_eq!(driver.halted().await, HaltReason::Divergence { anchor });
         assert_eq!(driver.metrics.halted(DIVERGENCE).get(), 1);
+        // The diverged height is released, but its journal is kept.
+        let (_, scheduler, _) = driver.finish().await;
+        assert!(scheduler.store().journal_bytes() > 0);
     }
 
     #[test]
@@ -1573,14 +1822,14 @@ mod tests {
         let metrics = metrics();
         let vote = Envelope::new(0, Payload::Attest(Checkpoint::new_for_test(1))).to_bytes();
         state.count_arrivals(&metrics, Duration::ZERO, &block(1, 3, vec![vote]));
-        assert_eq!(state.halt_reason(&metrics), None);
+        assert_eq!(state.halt_reason(&metrics, 0), None);
         assert!(metrics.retained_bytes().get() > 0);
 
         // A commit of a later round with nothing to execute: the voted anchor never mints.
         let unminted = subdag_at(2, vec![(1, vec![vec![0xFF; 16]])]);
         state.execute(&metrics, Duration::ZERO, unminted);
         assert_eq!(state.certifier.retained_bytes(), 0);
-        assert_eq!(state.halt_reason(&metrics), None);
+        assert_eq!(state.halt_reason(&metrics, 0), None);
         assert_eq!(metrics.retained_bytes().get(), 0);
     }
 

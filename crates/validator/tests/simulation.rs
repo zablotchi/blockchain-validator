@@ -760,7 +760,9 @@ fn fork_free_runs_defer_nothing() {
 }
 
 /// Without forks, heights conclude in order, so releasing them in order delays none: every
-/// decision is observed when it was concluded, as before ordered release.
+/// decision is observed when it was concluded, as before ordered release. And what a validator
+/// keeps for recovery (kept transactions, journals, evidence, queued votes) goes with the
+/// heights it was kept for.
 #[test]
 fn fork_free_runs_never_wait_for_a_predecessor() {
     for seed in [7, 42, 1234] {
@@ -770,10 +772,13 @@ fn fork_free_runs_never_wait_for_a_predecessor() {
                     finality,
                     ..Default::default()
                 };
-                let committee = generate_load(parameters).await;
+                let mut committee = generate_load(parameters).await;
+                committee.wait_for_decided().await;
                 for validator in committee.validators() {
                     let waits = validator.metrics().release_waits().get();
                     assert_eq!(waits, 0, "{finality} seed {seed}");
+                    let retained = validator.metrics().retained_bytes().get();
+                    assert_eq!(retained, 0, "{finality} seed {seed}");
                 }
                 committee.shutdown().await;
             });

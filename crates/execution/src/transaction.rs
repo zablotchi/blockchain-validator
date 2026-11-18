@@ -74,6 +74,11 @@ impl Transaction {
         &self.inputs
     }
 
+    /// The bytes this transaction holds in memory.
+    pub fn memory_bytes(&self) -> usize {
+        size_of::<Self>() + size_of_val(self.inputs.as_slice()) + self.args.len()
+    }
+
     /// Statically verifies the transaction, independently of any state.
     pub fn verify(&self) -> bool {
         // No duplicate ids in the inputs list.
