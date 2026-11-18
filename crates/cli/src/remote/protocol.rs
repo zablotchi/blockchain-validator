@@ -334,6 +334,30 @@ impl ProtocolMetrics for ValidatorProtocol {
                 name: validator::metrics::CHECKPOINT_RELEASE_WAITS.into(),
                 kind: MetricKind::Gauge,
             },
+            // Fork-recovery episodes: the accounting family and the skipped transactions are
+            // totals, collected raw like the decision accounting, and the episode family holds
+            // one gauge per validator, episode and quantity, so that every record lands in the
+            // measurements.
+            MetricSpec {
+                name: validator::metrics::FORK_RECOVERY_ACCOUNTING.into(),
+                kind: MetricKind::Gauge,
+            },
+            MetricSpec {
+                name: validator::metrics::FORK_RECOVERY_EPISODE.into(),
+                kind: MetricKind::Gauge,
+            },
+            MetricSpec {
+                name: validator::metrics::VALIDATOR_SKIPPED_TRANSACTIONS.into(),
+                kind: MetricKind::Gauge,
+            },
+            MetricSpec {
+                name: validator::metrics::FORK_RECOVERY_STALL_S.into(),
+                kind: MetricKind::Histogram,
+            },
+            MetricSpec {
+                name: validator::metrics::FORK_RECOVERY_RE_EXECUTED_HEIGHTS.into(),
+                kind: MetricKind::Histogram,
+            },
             MetricSpec {
                 name: validator::metrics::SUBMITTED_TRANSACTIONS.into(),
                 kind: MetricKind::Counter,
@@ -399,9 +423,10 @@ mod tests {
 
     use orchestrator::{collector::MetricKind, protocol::ProtocolMetrics};
     use validator::metrics::{
-        CHECKPOINT_RELEASE_WAITS, MAX_PROPOSAL_BYTES, MAX_PROPOSAL_PROTOCOL_BYTES,
-        PROTOCOL_PAYLOADS_SUBMITTED, PROTOCOL_SUBMISSIONS_DEFERRED, VALIDATOR_HALTED,
-        VALIDATOR_RETAINED_BYTES,
+        CHECKPOINT_RELEASE_WAITS, FORK_RECOVERY_ACCOUNTING, FORK_RECOVERY_EPISODE,
+        FORK_RECOVERY_RE_EXECUTED_HEIGHTS, FORK_RECOVERY_STALL_S, MAX_PROPOSAL_BYTES,
+        MAX_PROPOSAL_PROTOCOL_BYTES, PROTOCOL_PAYLOADS_SUBMITTED, PROTOCOL_SUBMISSIONS_DEFERRED,
+        VALIDATOR_HALTED, VALIDATOR_RETAINED_BYTES, VALIDATOR_SKIPPED_TRANSACTIONS,
     };
 
     use crate::remote::protocol::{NodeParameters, ValidatorProtocol};
@@ -436,6 +461,30 @@ mod tests {
                 .find(|spec| spec.name == name)
                 .map(|spec| &spec.kind);
             assert!(matches!(kind, Some(MetricKind::Gauge)), "{name}");
+        }
+    }
+
+    /// The per-episode records and their totals are collected raw, and the recovery histograms
+    /// as histograms.
+    #[test]
+    fn protocol_metrics_include_the_recovery_metrics() {
+        let protocol = ValidatorProtocol {
+            working_dir: PathBuf::new(),
+        };
+        let specs = protocol.metrics();
+        let kind = |name| {
+            let spec = specs.iter().find(|spec| spec.name == name);
+            spec.map(|spec| &spec.kind)
+        };
+        for name in [
+            FORK_RECOVERY_ACCOUNTING,
+            FORK_RECOVERY_EPISODE,
+            VALIDATOR_SKIPPED_TRANSACTIONS,
+        ] {
+            assert!(matches!(kind(name), Some(MetricKind::Gauge)), "{name}");
+        }
+        for name in [FORK_RECOVERY_STALL_S, FORK_RECOVERY_RE_EXECUTED_HEIGHTS] {
+            assert!(matches!(kind(name), Some(MetricKind::Histogram)), "{name}");
         }
     }
 

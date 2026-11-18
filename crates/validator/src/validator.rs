@@ -47,6 +47,7 @@ use tokio::{
 use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
+    episode::{EpisodeLog, Work},
     fork::ForkInjection,
     limits::{self, CLIENT_BATCH_BYTES, split_batch},
     metrics::{
@@ -208,6 +209,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
                 staged: Staged::default(),
                 re_minted: Vec::new(),
                 divergences: 0,
+                episodes: EpisodeLog::default(),
             },
             authority: self.authority,
             public_config: self.public_config,
@@ -267,6 +269,8 @@ struct ExecutionState<E> {
     re_minted: Vec<(BlockReference, u32)>,
     /// The released heights this validator's state diverged at so far.
     divergences: u64,
+    /// The fork episodes' records still open, under fork injection.
+    episodes: EpisodeLog,
 }
 
 /// Own votes and certificates in the order they were produced, keeping only the newest
@@ -484,8 +488,13 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
         } = self;
         let client_latency = driver_metrics.client_commit_latency_s().local();
         let times_out = state.certifier.protocol().times_out();
-        // Phase-one timeouts are kept by the driver's clock since this instant.
+        // Phase-one timeouts are kept, and recoveries timed, by the driver's clock since this
+        // instant.
         let epoch = C::now();
+        let recovery_epoch = epoch.clone();
+        state
+            .episodes
+            .set_clock(move || C::elapsed(&recovery_epoch));
         // Re-attest checkpoints undecided at replay: votes in flight at shutdown died
         // with the transaction queue, and a validator otherwise attests only once, so an
         // undecided checkpoint could stall forever. The certifier's per-author dedupe
@@ -504,7 +513,15 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
                 .into_iter()
                 .map(|checkpoint| Outgoing::vote(timestamp_ms, 0, checkpoint))
                 .collect();
-            Self::submit(&mut outbox, &client, &driver_metrics, attestations).await;
+            let episodes = &mut state.episodes;
+            Self::submit(
+                &mut outbox,
+                &client,
+                &driver_metrics,
+                episodes,
+                attestations,
+            )
+            .await;
         }
         // Replay released into its own metrics; the live ones start from the replayed window.
         state.settle(&driver_metrics, C::timestamp_utc());
@@ -589,18 +606,23 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
             }
             // Votes and certificates ride this validator's own signed blocks, behind any
             // payloads an own proposal has made room for.
-            Self::submit(&mut outbox, &client, &driver_metrics, outgoing).await;
+            let episodes = &mut state.episodes;
+            Self::submit(&mut outbox, &client, &driver_metrics, episodes, outgoing).await;
+            let queued = |episode| outbox.holds_re_votes_of(episode);
+            state.episodes.finish(&driver_metrics, queued);
         }
         (state.scheduler, state.certifier)
     }
 
     /// Queues one event's payloads (possibly none) and submits, in one batch, the queued ones
-    /// the protocol byte budget admits. Failure is benign: the replica is shutting down, lost
-    /// votes are resubmitted after replay, and certificates conclude again from them.
+    /// the protocol byte budget admits, counting the re-votes of fork episodes in `episodes`.
+    /// Failure is benign: the replica is shutting down, lost votes are resubmitted after
+    /// replay, and certificates conclude again from them.
     async fn submit(
         outbox: &mut ProtocolOutbox,
         client: &S,
         metrics: &ValidatorMetrics,
+        episodes: &mut EpisodeLog,
         payloads: Vec<Outgoing>,
     ) {
         let queued = !payloads.is_empty();
@@ -608,11 +630,19 @@ impl<E: ExecutionEngine + Send + 'static, S: Submitter> Driver<E, S> {
         let batch = outbox.next_batch();
         if !batch.is_empty() {
             let count = batch.len() as u64;
-            if client.submit(batch).await.is_err() {
+            let re_votes: Vec<_> = batch
+                .iter()
+                .filter_map(|outgoing| outgoing.episode)
+                .collect();
+            let payloads = batch.into_iter().map(|outgoing| outgoing.payload).collect();
+            if client.submit(payloads).await.is_err() {
                 tracing::debug!("submission failed; shutting down");
                 return;
             }
             metrics.inc_protocol_payloads_submitted(count);
+            for episode in re_votes {
+                episodes.submitted_re_vote(metrics, episode);
+            }
         }
         if queued && !outbox.is_empty() {
             metrics.inc_protocol_submissions_deferred();
@@ -778,9 +808,13 @@ impl<E: ExecutionEngine> ExecutionState<E> {
         let mut re_minted_any = false;
         // The lowest kept height that a rewind undid and that is not executed again yet.
         let mut stale = None;
+        // The fork episode the recovery in progress is attributed to.
+        let mut episode = None;
         loop {
             self.certifier.release();
             let mut released = 0;
+            // The forked heights released: episode, height, first mint and outcome.
+            let mut forked = Vec::new();
             for Released {
                 outcome,
                 timings,
@@ -797,10 +831,25 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 if waited {
                     metrics.inc_release_waits();
                 }
+                if let Some(fork) = &self.fork {
+                    let height = self.kept[released].height;
+                    if let Some(index) = fork.episode(height) {
+                        forked.push((index, height, timings.minted_at, outcome));
+                    }
+                }
                 released += 1;
             }
             released_any |= released > 0;
             let divergence = self.certifier.take_divergence();
+            if released > 0 && self.fork.is_some() {
+                let highest = self.kept[released - 1].height;
+                let (diverged, minted) = (divergence.is_some(), self.minted);
+                let attributed =
+                    (self.episodes).release(metrics, now, forked, highest, diverged, minted);
+                if diverged {
+                    episode = attributed;
+                }
+            }
             // A diverged height is released last, and its rewind needs what is kept of it.
             let stable = released - usize::from(divergence.is_some());
             let mut highest = None;
@@ -812,7 +861,7 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                 self.scheduler.store_mut().prune_through(height);
             }
             if let Some(divergence) = divergence {
-                if !self.rewind(divergence) {
+                if !self.rewind(metrics, divergence, episode) {
                     break;
                 }
                 stale = self.kept.front().map(|kept| kept.height);
@@ -821,7 +870,7 @@ impl<E: ExecutionEngine> ExecutionState<E> {
             let Some(height) = stale else {
                 break;
             };
-            self.re_execute(height, now);
+            self.re_execute(metrics, height, now, episode);
             re_minted_any = true;
             if self.halt.is_some() {
                 break;
@@ -846,18 +895,32 @@ impl<E: ExecutionEngine> ExecutionState<E> {
 
     /// Recovers from `divergence`, at the front kept height, just released: undoes that height
     /// and every later one, then gives the store the height's canonical state, by folding in
-    /// the skip marker or by executing the height again and adopting the finalized state.
-    /// Returns false if no state matches the finalized commitment, which halts this validator.
-    fn rewind(&mut self, Divergence { anchor, outcome }: Divergence) -> bool {
+    /// the skip marker (counting the height's transactions as skipped) or by executing the
+    /// height again and adopting the finalized state. The work goes to the record of fork
+    /// episode `episode`, if any. Returns false if no state matches the finalized commitment,
+    /// which halts this validator.
+    fn rewind(
+        &mut self,
+        metrics: &ValidatorMetrics,
+        Divergence { anchor, outcome }: Divergence,
+        episode: Option<u64>,
+    ) -> bool {
+        let started = self.episodes.now();
         let kept = self.kept.pop_front().expect("the diverged height is kept");
         debug_assert_eq!(kept.anchor, anchor);
         self.kept_bytes -= kept.bytes();
         self.divergences += 1;
+        let transactions = kept.transactions.len() as u64;
         let store = self.scheduler.store_mut();
         store.undo_from(kept.height);
         store.begin_height(kept.height);
+        let mut work = Work::default();
         match outcome {
-            Outcome::Skip => store.apply_skip(&anchor_bytes(anchor)),
+            Outcome::Skip => {
+                store.apply_skip(&anchor_bytes(anchor));
+                metrics.inc_skipped_transactions(transactions);
+                work.skipped = transactions;
+            }
             Outcome::Finalize(finalized) => {
                 self.scheduler.execute(&kept.transactions);
                 if !self.adopt(kept.height, finalized) {
@@ -865,9 +928,13 @@ impl<E: ExecutionEngine> ExecutionState<E> {
                         .get_or_insert(HaltReason::NoMatchingCandidate { anchor });
                     return false;
                 }
+                work.heights = 1;
+                work.transactions = transactions;
             }
         }
         self.scheduler.store_mut().prune_through(kept.height);
+        work.time = self.episodes.now().saturating_sub(started);
+        self.episodes.recovered(metrics, episode, work);
         true
     }
 
@@ -897,21 +964,38 @@ impl<E: ExecutionEngine> ExecutionState<E> {
     /// Executes the kept height `height` again, after a rewind undid it, with this validator's
     /// fork write if it forks there, and re-mints its checkpoint on the recovered parent:
     /// stages the re-vote and any certificate the rebuilt instance concludes, and under C
-    /// restarts its timer. Re-execution observes nothing. Halts if the validator then retains
-    /// more than the evidence budget.
-    fn re_execute(&mut self, height: u64, now: Duration) {
+    /// restarts its timer. Re-execution observes nothing but the record of fork episode
+    /// `episode`, if any, which gets the work and the re-vote. Halts if the validator then
+    /// retains more than the evidence budget.
+    fn re_execute(
+        &mut self,
+        metrics: &ValidatorMetrics,
+        height: u64,
+        now: Duration,
+        episode: Option<u64>,
+    ) {
+        let started = self.episodes.now();
         let index = (height - self.kept[0].height) as usize;
         let parent = self.scheduler.store().commitment();
         self.scheduler.store_mut().begin_height(height);
-        self.scheduler.execute(&self.kept[index].transactions);
+        let transactions = &self.kept[index].transactions;
+        self.scheduler.execute(transactions);
+        let work = Work {
+            heights: 1,
+            transactions: transactions.len() as u64,
+            ..Work::default()
+        };
         self.apply_fork_write(height);
         let anchor = self.kept[index].anchor;
         let commitment = self.scheduler.store().commitment();
         let re_vote = self.certifier.re_mint(anchor, commitment, parent);
+        let time = self.episodes.now().saturating_sub(started);
+        (self.episodes).recovered(metrics, episode, Work { time, ..work });
         let generation = self.certifier.generation(anchor).expect("re-minted");
         let timestamp_ms = now.as_millis() as u64;
-        self.staged
-            .stage(Outgoing::vote(timestamp_ms, generation, re_vote));
+        let mut re_vote = Outgoing::vote(timestamp_ms, generation, re_vote);
+        re_vote.episode = episode;
+        self.staged.stage(re_vote);
         self.stage_certificates(now);
         if self.certifier.protocol().times_out() {
             self.re_minted.push((anchor, generation));
@@ -1182,11 +1266,12 @@ mod tests {
 
     use crate::{
         envelope::{Envelope, Payload},
+        episode::{EpisodeLog, Role},
         fork::ForkInjection,
         limits::{self, CLIENT_BATCH_BYTES, framed_size},
         metrics::{
-            EVIDENCE_BUDGET, FAST, FINALIZE, NO_MATCHING_CANDIDATE, SKIP, SLOW, UNSTABLE_HEIGHTS,
-            ValidatorMetrics,
+            EVIDENCE_BUDGET, FAST, FINALIZE, NO_MATCHING_CANDIDATE, RE_VOTES, SKIP, SLOW,
+            UNSTABLE_HEIGHTS, ValidatorMetrics,
         },
         outbox::{Kind, Outgoing, ProtocolOutbox},
         parameters::ValidatorParameters,
@@ -1242,6 +1327,7 @@ mod tests {
             staged: Staged::default(),
             re_minted: Vec::new(),
             divergences: 0,
+            episodes: EpisodeLog::default(),
         }
     }
 
@@ -2686,6 +2772,74 @@ mod tests {
         assert_eq!(certifier.pending().next(), Some(&re_vote));
     }
 
+    #[tokio::test]
+    async fn episode_re_votes_count_only_submitted_payloads() {
+        // Validator 0 forks alone at the first two heights, with room for one vote in flight.
+        let vote = Envelope::new(0, Payload::Attest(Checkpoint::new_for_test(1))).to_bytes();
+        let vote_bytes = framed_size(&ConsensusTransaction::new(vote.into()));
+        let mut state = state(FinalityProtocol::A);
+        state.fork = Some(ForkInjection {
+            episodes: NonZeroU64::new(2),
+            ..forking_once(&[&[0]])
+        });
+        let mut driver = TestDriver::spawn(state, vote_bytes);
+        let metrics = driver.metrics.clone();
+        // Four mints: the first vote goes out, the other three wait.
+        for round in 1..=4 {
+            let commit = subdag_at(round, vec![(0, vec![creation(round)])]);
+            driver.feed(DagEvent::Commit(commit)).await;
+        }
+        let [first_vote] = driver.recv().await.try_into().unwrap();
+        // Both forked heights skip, one after the other: the first episode re-votes heights 2
+        // to 4, then the second re-votes heights 3 and 4 again, replacing the first's queued
+        // re-votes for them.
+        let [first, second] = [1, 2].map(|round| BlockReference::new_test(0, round));
+        let skipped = Digest::default().skip(&anchor_bytes(first));
+        for skip in [
+            skipping(5, first, Digest::default()),
+            skipping(6, second, skipped),
+        ] {
+            driver.feed(DagEvent::Commit(skip)).await;
+        }
+        // Heights 3 and 4 finalize on the state both skips leave, ending both stalls while the
+        // re-votes still wait.
+        let mut canonical = SequentialScheduler::new(FakeExecutor);
+        for anchor in [first, second] {
+            canonical.store_mut().apply_skip(&anchor_bytes(anchor));
+        }
+        let finalized = [3, 4].map(|round| {
+            let parent = canonical.store().commitment();
+            canonical.execute(&[creation_transaction(round)]);
+            let anchor = BlockReference::new_test(0, round);
+            Checkpoint::new(anchor, canonical.store().commitment(), parent)
+        });
+        for (round, checkpoint) in [7, 8].into_iter().zip(&finalized) {
+            let votes = votes_from(round, &[1, 2], checkpoint);
+            driver.feed(DagEvent::Commit(votes)).await;
+        }
+        // Each own proposal makes room for the next queued re-vote.
+        let mut carried = first_vote;
+        let mut re_votes = Vec::new();
+        for round in 9..12 {
+            let proposal = block(0, round, vec![carried.as_bytes().to_vec()]);
+            driver.feed(DagEvent::Block(proposal)).await;
+            [carried] = driver.recv().await.try_into().unwrap();
+            re_votes.push(Envelope::attestation_from_bytes(carried.as_bytes()).expect("a vote"));
+        }
+        let (mut submitted, _, certifier) = driver.finish().await;
+
+        assert!(submitted.recv().await.is_none());
+        assert!(certifier.pending().next().is_none());
+        assert_eq!(re_votes[0].anchor(), second);
+        assert_eq!(re_votes[1..], finalized);
+        // The first episode's re-vote for height 2 went out, the second's for heights 3 and 4,
+        // and each record joined the accounting only once its re-votes had.
+        let episodes = metrics.episodes();
+        let re_votes: Vec<_> = episodes.values().map(|record| record.re_votes).collect();
+        assert_eq!(re_votes, [1, 2]);
+        assert_eq!(metrics.recovery_accounting(Role::Skip, RE_VOTES), 3.0);
+    }
+
     /// A [`FakeExecutor`] counting the executions of each transaction, by its first input.
     struct CountingExecutor(Rc<RefCell<BTreeMap<ObjectId, usize>>>);
 
@@ -2699,9 +2853,13 @@ mod tests {
 
     /// Validator 0 forks alone at every height under A and mints heights 1 to 40; the
     /// canonical votes for heights 2 to 10 commit, then one commit mints height 41 and
-    /// finalizes height 1, so that ten divergences cascade in one event. Returns the state and
-    /// how many times each round's transaction executed.
-    fn cascade() -> (ExecutionState<CountingExecutor>, BTreeMap<ObjectId, usize>) {
+    /// finalizes height 1, so that ten divergences cascade in one event. Returns the state, how
+    /// many times each round's transaction executed, and the metrics.
+    fn cascade() -> (
+        ExecutionState<CountingExecutor>,
+        BTreeMap<ObjectId, usize>,
+        Arc<ValidatorMetrics>,
+    ) {
         let metrics = metrics();
         let counts = Rc::default();
         let mut state = state_with(CountingExecutor(Rc::clone(&counts)), FinalityProtocol::A);
@@ -2730,12 +2888,12 @@ mod tests {
             .expect("decided checkpoint");
         assert_eq!(decided.anchor(), canonical[9].anchor());
         let counts = counts.borrow().clone();
-        (state, counts)
+        (state, counts, metrics)
     }
 
     #[test]
     fn cascading_recoveries_stage_one_payload_per_height() {
-        let (state, _) = cascade();
+        let (state, ..) = cascade();
         // Everything above height 1 was re-minted once: one re-vote per height.
         let anchors: BTreeSet<_> = state.staged.list.iter().map(|o| o.anchor).collect();
         assert_eq!(state.staged.list.len(), 40);
@@ -2748,13 +2906,89 @@ mod tests {
 
     #[test]
     fn cascading_recoveries_re_execute_each_height_at_most_twice() {
-        let (_, counts) = cascade();
+        let (_, counts, metrics) = cascade();
         // Height 1 executes again to adopt the canonical state, heights 2 to 10 to catch up
         // and then to adopt it, and the rest once to catch up.
         let executions = |round| counts[&ObjectId::new(round)];
         assert_eq!(executions(1), 2);
         assert!((2..=10).all(|round| executions(round) == 3));
         assert!((11..=40).chain([42]).all(|round| executions(round) == 2));
+        // The episodes of the ten diverged heights account for every execution done again,
+        // one transaction per height: each adopts and catches up the next height, and the
+        // last catches up the rest.
+        let records = metrics.episodes();
+        let heights: Vec<_> = records.values().map(|r| r.re_executed_heights).collect();
+        assert_eq!(heights, [&[2; 9][..], &[32]].concat());
+        let again: usize = counts.values().map(|executions| executions - 1).sum();
+        assert_eq!(heights.iter().sum::<u64>(), again as u64);
+        assert!(
+            records
+                .values()
+                .all(|r| r.re_executed_transactions == r.re_executed_heights)
+        );
+    }
+
+    #[test]
+    fn divergences_inside_a_stall_go_to_its_episode() {
+        // Validator 0 forks at the first height only, and mints heights 1 to 3 at 0 s.
+        let mut state = state(FinalityProtocol::A);
+        state.fork = Some(forking_once(&[&[0]]));
+        let metrics = metrics();
+        mint_rounds(&mut state, &metrics, 1..=3, Duration::ZERO);
+        let [first, second] = [1, 2].map(|round| BlockReference::new_test(0, round));
+        // The forked height skips at 1 s, then height 2, not forked, skips at 2 s, while height 3,
+        // pending at the first release, is not released yet.
+        let skipped = Digest::default().skip(&anchor_bytes(first));
+        let skips = [
+            skipping(4, first, Digest::default()),
+            skipping(5, second, skipped),
+        ];
+        for (seconds, skip) in (1..).zip(skips) {
+            state.execute(&metrics, Duration::from_secs(seconds), skip);
+        }
+        // Height 3 finalizes at 3 s: the stall ends.
+        let third = state.certifier.pending().next().cloned().expect("pending");
+        let votes = votes_from(6, &[1, 2], &third);
+        state.execute(&metrics, Duration::from_secs(3), votes);
+
+        let records = metrics.episodes();
+        assert_eq!(records.keys().collect::<Vec<_>>(), [&1]);
+        let record = records[&1];
+        assert_eq!(record.role, Role::Skip);
+        assert_eq!(record.detection, Duration::from_secs(1));
+        assert_eq!(record.stall, Some(Duration::from_secs(3)));
+        // Both skips, heights 2 and 3 caught up after the first and height 3 after the second.
+        assert_eq!(record.skipped_transactions, 2);
+        assert_eq!(record.re_executed_heights, 3);
+        assert_eq!(record.re_executed_transactions, 3);
+    }
+
+    #[test]
+    fn divergences_outside_every_stall_go_to_no_episode() {
+        let mut state = state(FinalityProtocol::A);
+        state.fork = Some(forking_once(&[&[0]]));
+        let metrics = metrics();
+        // The forked height skips at 1 s with nothing pending above it: its stall ends at once.
+        let [first] = mint_rounds(&mut state, &metrics, [1], Duration::ZERO)
+            .try_into()
+            .unwrap();
+        let skip = skipping(2, first.anchor(), Digest::default());
+        state.execute(&metrics, Duration::from_secs(1), skip);
+        let record = metrics.episodes()[&1];
+        assert_eq!(record.detection, Duration::from_secs(1));
+        assert_eq!(record.stall, Some(Duration::from_secs(1)));
+        assert_eq!(record.skipped_transactions, 1);
+
+        // Height 2, not forked, skips later: no episode's recovery.
+        let skipped = Digest::default().skip(&anchor_bytes(first.anchor()));
+        let [second] = mint_rounds(&mut state, &metrics, [3], Duration::from_secs(2))
+            .try_into()
+            .unwrap();
+        let skip = skipping(4, second.anchor(), skipped);
+        state.execute(&metrics, Duration::from_secs(3), skip);
+        assert_eq!(state.divergences, 2);
+        assert_eq!(metrics.episodes()[&1], record);
+        assert_eq!(metrics.skipped_transactions().get(), 2);
     }
 
     #[tokio::test(start_paused = true)]

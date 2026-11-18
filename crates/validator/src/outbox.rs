@@ -33,6 +33,8 @@ pub(crate) struct Outgoing {
     pub(crate) anchor: BlockReference,
     pub(crate) kind: Kind,
     pub(crate) generation: u32,
+    /// The fork episode whose recovery re-voted it, if it is such a re-vote.
+    pub(crate) episode: Option<u64>,
     pub(crate) payload: ConsensusTransaction,
 }
 
@@ -72,6 +74,7 @@ impl Outgoing {
             anchor,
             kind,
             generation,
+            episode: None,
             payload: ConsensusTransaction::new(bytes.into()),
         }
     }
@@ -138,7 +141,7 @@ impl ProtocolOutbox {
     /// The payloads to submit now, counted as outstanding: from the front of the queue, as many
     /// as the budget admits. One always passes when nothing is outstanding, so a payload larger
     /// than the budget cannot block the queue.
-    pub(crate) fn next_batch(&mut self) -> Vec<ConsensusTransaction> {
+    pub(crate) fn next_batch(&mut self) -> Vec<Outgoing> {
         let mut batch = Vec::new();
         while let Some(front) = self.queue.front() {
             let bytes = front.bytes();
@@ -147,7 +150,7 @@ impl ProtocolOutbox {
             }
             self.outstanding += bytes;
             self.queued -= bytes;
-            batch.extend(self.queue.pop_front().map(|outgoing| outgoing.payload));
+            batch.extend(self.queue.pop_front());
         }
         batch
     }
@@ -160,6 +163,11 @@ impl ProtocolOutbox {
     /// The framed bytes of the payloads waiting for the budget.
     pub(crate) fn queued_bytes(&self) -> u64 {
         self.queued
+    }
+
+    /// Whether a re-vote of fork episode `episode` waits for the budget.
+    pub(crate) fn holds_re_votes_of(&self, episode: u64) -> bool {
+        (self.queue.iter()).any(|outgoing| outgoing.episode == Some(episode))
     }
 
     /// Releases the protocol payloads of `block` if this validator authored it, and returns
@@ -238,6 +246,12 @@ mod tests {
         block(author, checkpoints.iter().map(|&n| submitted(n)).collect())
     }
 
+    /// The payloads of the next batch.
+    fn next_payloads(outbox: &mut ProtocolOutbox) -> Vec<ConsensusTransaction> {
+        let batch = outbox.next_batch().into_iter();
+        batch.map(|outgoing| outgoing.payload).collect()
+    }
+
     /// The framed size of one vote.
     fn vote_bytes() -> u64 {
         vote(0).bytes()
@@ -249,7 +263,7 @@ mod tests {
         let mut outbox = ProtocolOutbox::new(Authority::new(0), budget);
         let mut all = Vec::new();
         let mut submit = |outbox: &mut ProtocolOutbox| {
-            let batch = outbox.next_batch();
+            let batch = next_payloads(outbox);
             assert!(outbox.outstanding() <= budget);
             all.extend(batch.clone());
             batch.len()
@@ -275,10 +289,10 @@ mod tests {
         // With nothing outstanding, one payload passes even past the budget.
         let mut outbox = ProtocolOutbox::new(Authority::new(0), vote_bytes() - 1);
         outbox.enqueue(vec![vote(5), vote(6)]);
-        assert_eq!(outbox.next_batch(), [submitted(5)]);
-        assert_eq!(outbox.next_batch(), []);
+        assert_eq!(next_payloads(&mut outbox), [submitted(5)]);
+        assert_eq!(next_payloads(&mut outbox), []);
         outbox.observe_block(&voting(0, &[5]));
-        assert_eq!(outbox.next_batch(), [submitted(6)]);
+        assert_eq!(next_payloads(&mut outbox), [submitted(6)]);
     }
 
     #[test]
@@ -288,7 +302,7 @@ mod tests {
         for checkpoints in events {
             outbox.enqueue(checkpoints.iter().map(|&n| vote(n)).collect());
             let expected: Vec<_> = checkpoints.iter().map(|&n| submitted(n)).collect();
-            assert_eq!(outbox.next_batch(), expected);
+            assert_eq!(next_payloads(&mut outbox), expected);
             assert!(outbox.is_empty());
         }
     }
@@ -345,9 +359,9 @@ mod tests {
             assert_eq!(outbox.queued_bytes(), queued);
 
             outbox.observe_block(&voting(0, &[9]));
-            assert_eq!(outbox.next_batch(), [re_vote().payload]);
+            assert_eq!(next_payloads(&mut outbox), [re_vote().payload]);
             outbox.observe_block(&block(0, vec![re_vote().payload]));
-            assert_eq!(outbox.next_batch(), [certificate().payload]);
+            assert_eq!(next_payloads(&mut outbox), [certificate().payload]);
             assert!(outbox.is_empty());
         }
     }

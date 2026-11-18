@@ -38,6 +38,12 @@ impl ForkInjection {
                 .is_none_or(|episodes| height / period <= episodes.get())
     }
 
+    /// The index in the schedule of the episode forking height `height`, from 1, if it is
+    /// forked: every validator knows it, forked or not.
+    pub(crate) fn episode(&self, height: u64) -> Option<u64> {
+        self.forked(height).then(|| height / self.period.get())
+    }
+
     /// The fork write `authority` applies after executing height `height` on `state`, if any.
     pub(crate) fn write(
         &self,

@@ -36,10 +36,11 @@ use simulator::{
     LatencyModel, SimulatedNetwork, SimulatorContext, SimulatorExecutor, UniformLatency,
 };
 use validator::{
+    episode::Role,
     fork::ForkInjection,
     generator::LoadGeneratorConfig,
     limits::{self, PROPOSAL_BUDGET},
-    metrics::{FAST, FINALIZE, SKIP, SLOW, UNSTABLE_HEIGHTS},
+    metrics::{EPISODES, FAST, FINALIZE, SKIP, SKIPPED_TRANSACTIONS, SLOW, UNSTABLE_HEIGHTS},
     parameters::ValidatorParameters,
     validator::{HaltReason, ValidatorBuilder, ValidatorHandle},
 };
@@ -608,6 +609,64 @@ fn real_forks_skip_only_forked_heights_and_stores_converge() {
                     "{finality}"
                 );
             }
+        });
+    }
+}
+
+/// Every validator records every episode of the schedule, with the role it played: under a
+/// 4-way split all skip, and against a single liar the liar adopts and the others win.
+#[test]
+fn episode_records_match_the_recoveries() {
+    let liar = vec![vec![COMMITTEE_SIZE - 1]];
+    let runs = [
+        (FinalityProtocol::A, None),
+        (FinalityProtocol::B, None),
+        (FinalityProtocol::C, None),
+        (FinalityProtocol::A, Some(liar)),
+    ];
+    for (finality, groups) in runs {
+        SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
+            let parameters = match &groups {
+                None => fragmented(finality),
+                Some(groups) => forking(finality, groups, FORK_PERIOD, Some(FORK_EPISODES)),
+            };
+            let context = format!("{finality} {groups:?}");
+            let mut committee = generate_load(parameters).await;
+            committee.wait_for_decided().await;
+            for (index, validator) in committee.validators().iter().enumerate() {
+                let role = match groups {
+                    None => Role::Skip,
+                    Some(_) if index == COMMITTEE_SIZE - 1 => Role::Adopt,
+                    Some(_) => Role::Winner,
+                };
+                let metrics = validator.metrics();
+                let episodes = metrics.episodes();
+                let indices: Vec<_> = episodes.keys().copied().collect();
+                assert_eq!(indices, Vec::from_iter(1..=FORK_EPISODES), "{context}");
+                for (episode, record) in episodes {
+                    let context = format!("{context}: validator {index}, episode {episode}");
+                    assert_eq!(record.height, episode * FORK_PERIOD, "{context}");
+                    assert_eq!(record.role, role, "{context}");
+                    let stall = record.stall.expect("every stall ends");
+                    assert!(record.detection > Duration::ZERO, "{context}");
+                    assert!(stall >= record.detection, "{context}");
+                    assert_eq!(record.recovery, Duration::ZERO, "{context}");
+                    let recovered = role != Role::Winner;
+                    assert_eq!(record.re_executed_heights > 0, recovered, "{context}");
+                    if !recovered {
+                        assert_eq!(record.re_votes, 0, "{context}");
+                    }
+                    let skipped = record.skipped_transactions;
+                    assert_eq!(skipped > 0, role == Role::Skip, "{context}");
+                }
+                // Each final, and accounted once.
+                let accounted = metrics.recovery_accounting(role, EPISODES);
+                assert_eq!(accounted, FORK_EPISODES as f64, "{context}");
+                let skipped = metrics.recovery_accounting(role, SKIPPED_TRANSACTIONS);
+                let counted = metrics.skipped_transactions().get();
+                assert_eq!(skipped, counted as f64, "{context}");
+            }
+            committee.shutdown().await;
         });
     }
 }
