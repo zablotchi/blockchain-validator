@@ -35,7 +35,9 @@ pub struct Testbed {
 impl Testbed {
     /// Boots a committee with ephemeral storage.
     pub async fn start(port_offset: u16) -> Self {
-        Self::boot(None, port_offset, &ValidatorParameters::default()).await
+        let parameters = ValidatorParameters::default();
+        let testbed = Self::boot(None, port_offset, &parameters).await;
+        testbed.expect("validators must start")
     }
 
     /// Boots a committee running with `parameters`, persisting each replica's WAL under `dir`.
@@ -44,10 +46,24 @@ impl Testbed {
         port_offset: u16,
         parameters: &ValidatorParameters,
     ) -> Self {
+        let testbed = Self::try_start_with_wal(dir, port_offset, parameters).await;
+        testbed.expect("validators must start")
+    }
+
+    /// [`start_with_wal`](Testbed::start_with_wal), failing if a validator does not start.
+    pub async fn try_start_with_wal(
+        dir: &Path,
+        port_offset: u16,
+        parameters: &ValidatorParameters,
+    ) -> eyre::Result<Self> {
         Self::boot(Some(dir), port_offset, parameters).await
     }
 
-    async fn boot(dir: Option<&Path>, port_offset: u16, parameters: &ValidatorParameters) -> Self {
+    async fn boot(
+        dir: Option<&Path>,
+        port_offset: u16,
+        parameters: &ValidatorParameters,
+    ) -> eyre::Result<Self> {
         let public_config =
             PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE).with_port_offset(port_offset);
         let private_configs = PrivateReplicaConfig::new_for_benchmarks(
@@ -76,17 +92,15 @@ impl Testbed {
             .with_storage(storage)
             .with_registry(registry)
             .with_parameters(parameters.clone())
-            .build()
-            .expect("validator must build")
+            .build()?
             .start::<TokioCtx>()
-            .await
-            .expect("validator must start");
+            .await?;
             validators.push(validator);
         }
-        Self {
+        Ok(Self {
             validators,
             registries,
-        }
+        })
     }
 
     pub fn registries(&self) -> &[Registry] {

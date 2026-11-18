@@ -23,8 +23,9 @@ impl Digest {
         &self.0
     }
 
-    /// The hash of this digest and `salt`: deterministic, and distinct per salt. Fabricates
-    /// diverging commitments without touching the state they commit to.
+    /// The hash of this digest and `salt`: deterministic, and distinct per salt, for tests that
+    /// need many unequal digests.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn salted(&self, salt: u64) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(self.0);

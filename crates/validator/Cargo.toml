@@ -31,4 +31,9 @@ simulator.workspace = true
 # Self-dependency turning on the gated load generator for the test targets.
 validator = { workspace = true, features = ["benchmark"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+  "time",
+] }

@@ -51,6 +51,9 @@ impl Debug for NodeParameters {
         }
         if let Some(fork) = &self.validator.fork {
             write!(f, "-fork-{}g-every-{}", fork.groups.len(), fork.period)?;
+            if let Some(episodes) = fork.episodes {
+                write!(f, "-x{episodes}")?;
+            }
         }
         Ok(())
     }
@@ -441,6 +444,10 @@ mod tests {
         assert_eq!(
             name("finality: a\nfork:\n  groups: [[1, 2], [3]]\n  period: 5\n"),
             "mysticeti-l1-a-fork-2g-every-5"
+        );
+        assert_eq!(
+            name("finality: a\nfork:\n  groups: [[3]]\n  period: 200\n  episodes: 5\n"),
+            "mysticeti-l1-a-fork-1g-every-200-x5"
         );
     }
 

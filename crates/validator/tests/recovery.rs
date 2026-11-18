@@ -4,7 +4,7 @@
 //! Full-committee restart: execution state is rebuilt by replaying the consensus WAL.
 //!
 //! Port offsets across test binaries: mysticeti uses 0-500, smoke.rs uses 3000, and this file
-//! uses 3100-3400 and 3700-4600 (a fresh offset per start avoids rebinding ports still in
+//! uses 3100-3400 and 3700-4800 (a fresh offset per start avoids rebinding ports still in
 //! TIME_WAIT). Offset 3500 would bind port 5000, taken by macOS's AirPlay receiver.
 
 mod common;
@@ -190,10 +190,11 @@ async fn restarted_committee_recertifies_lost_votes_under_protocol_c() {
     recertifies_lost_votes(deciding(FinalityProtocol::C), 4300).await;
 }
 
-/// With every height forked, the re-attested votes conclude only once timed out: the replayed
-/// checkpoints' phase-one timeouts are re-armed, as no new mint will expire them.
+/// A forked committee's WAL holds diverged commits, which replay cannot recover from:
+/// restarting on it is refused.
 #[tokio::test]
-async fn restarted_committee_skips_lost_forked_heights_under_protocol_c() {
+async fn forked_committees_refuse_to_restart_on_their_wal() {
+    let dir = tempfile::tempdir().expect("temporary directory");
     // Every validator but the first forks alone at every height.
     let groups = (1..COMMITTEE_SIZE)
         .map(|index| vec![Authority::from(index)])
@@ -202,10 +203,50 @@ async fn restarted_committee_skips_lost_forked_heights_under_protocol_c() {
         fork: Some(ForkInjection {
             groups,
             period: NonZeroU64::MIN,
+            episodes: None,
         }),
         ..deciding(FinalityProtocol::C)
     };
-    recertifies_lost_votes(parameters, 4500).await;
+    // An empty WAL starts.
+    let mut testbed = Testbed::start_with_wal(dir.path(), 4500, &parameters).await;
+    let create = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]).into();
+    testbed.submit(0, vec![create]).await;
+    testbed.wait_for_transactions(1).await;
+    testbed.shutdown().await;
+
+    let restarted = Testbed::try_start_with_wal(dir.path(), 4600, &parameters).await;
+    let error = restarted.err().expect("the restart must be refused");
+    assert!(error.to_string().contains("needs an empty WAL"), "{error}");
+}
+
+/// Replay drains what it stages: once everything is decided before the halt, the restarted
+/// validators submit nothing until they mint, and retain nothing.
+#[tokio::test]
+async fn restarted_committee_re_attests_only_pending_checkpoints() {
+    const UPDATES: usize = 30;
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let id = ObjectId::new(1);
+    let total = (UPDATES + 1) as u64;
+    let parameters = deciding(FinalityProtocol::Baseline);
+    let mut testbed = Testbed::start_with_wal(dir.path(), 4700, &parameters).await;
+    let mut transactions = vec![FakeTransaction::success(vec![], vec![id], vec![]).into()];
+    transactions
+        .extend((0..UPDATES).map(|_| FakeTransaction::success(vec![], vec![], vec![id]).into()));
+    testbed.submit(0, transactions).await;
+    testbed.wait_for_transactions(total).await;
+    testbed.wait_for_decided().await;
+    testbed.wait_for_commits(COMMITS_TO_SETTLE).await;
+    testbed.shutdown().await;
+
+    let mut testbed = Testbed::start_with_wal(dir.path(), 4800, &parameters).await;
+    testbed.wait_for_transactions(total).await;
+    testbed.wait_for_commits(COMMITS_TO_SETTLE).await;
+    for validator in testbed.validators() {
+        let metrics = validator.metrics();
+        assert_eq!(metrics.protocol_payloads_submitted().get(), 0);
+        assert_eq!(metrics.retained_bytes().get(), 0);
+    }
+    testbed.shutdown().await;
 }
 
 /// Halts a committee running with `parameters` with votes in flight, then restarts it on
@@ -245,12 +286,7 @@ async fn recertifies_lost_votes(parameters: ValidatorParameters, port_offset: u1
     let certified = first_certifier
         .highest_decided()
         .expect("everything executed is certified");
-    let expected = match parameters.fork {
-        None => Outcome::Finalize(store.commitment()),
-        // Forked runs fork every height.
-        Some(_) => Outcome::Skip,
-    };
-    assert_eq!(certified.outcome(), expected);
+    assert_eq!(certified.outcome(), Outcome::Finalize(store.commitment()));
     let finality = parameters.finality;
     for (scheduler, certifier) in &rebuilt {
         assert_eq!(scheduler.store(), store);

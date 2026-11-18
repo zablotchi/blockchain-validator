@@ -88,8 +88,8 @@ mod tests {
     const CONSENSUS: &str = "consensus:\n  protocol: mysticeti\n  leader_count: 1\n";
     const DAG: &str = "dag:\n  round_timeout: null\n  max_block_size: 1024\n  \
         enable_synchronizer: false\n  fsync: true\n";
-    const VALIDATOR: &str = "finality: c\nfork:\n  groups: [[1], [2, 3]]\n  period: 5\n\
-        phase_one_timeout: 250ms\nevidence_budget_bytes: 1048576\n\
+    const VALIDATOR: &str = "finality: c\nfork:\n  groups: [[1], [2, 3]]\n  period: 5\n  \
+        episodes: 3\nphase_one_timeout: 250ms\nevidence_budget_bytes: 1048576\n\
         protocol_bytes_in_flight: 2097152\nmax_unstable_heights: 64\n";
     const LOAD_GENERATOR: &str = "load: 10\ntransaction_size: 512\ninitial_delay: 10s\n";
 
@@ -161,6 +161,8 @@ mod tests {
         rejects::<ValidatorParameters>(window, "max_unstable_heights_typo");
         let fork = "fork:\n  groups: [[1]]\n  period: 5\n  period_typo: 3\n";
         rejects::<ValidatorParameters>(fork, "fork.period_typo");
+        let episodes = "fork:\n  groups: [[1]]\n  period: 5\n  episodes_typo: 3\n";
+        rejects::<ValidatorParameters>(episodes, "fork.episodes_typo");
 
         // The benchmark's node and client parameters.
         rejects::<NodeParameters>(&format!("{CONSENSUS}finality_typo: c\n"), "finality_typo");

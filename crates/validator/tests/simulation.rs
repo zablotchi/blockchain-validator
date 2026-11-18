@@ -39,9 +39,9 @@ use validator::{
     fork::ForkInjection,
     generator::LoadGeneratorConfig,
     limits::{self, PROPOSAL_BUDGET},
-    metrics::{FAST, FINALIZE, SKIP, SLOW},
+    metrics::{FAST, FINALIZE, SKIP, SLOW, UNSTABLE_HEIGHTS},
     parameters::ValidatorParameters,
-    validator::{ValidatorBuilder, ValidatorHandle},
+    validator::{HaltReason, ValidatorBuilder, ValidatorHandle},
 };
 
 const COMMITTEE_SIZE: usize = 4;
@@ -58,8 +58,10 @@ const SUBMISSION_INTERVAL: Duration = Duration::from_millis(100);
 /// A few generated transactions per consensus block, so the generator's block-splitting path
 /// (mid-batch flushes plus a partial trailing block) is exercised on every tick.
 const MAX_BLOCK_SIZE: usize = 512;
-/// Fork injection fragments every this many checkpoint heights.
-const FORK_PERIOD: u64 = 5;
+/// Fork injection forks every this many checkpoint heights...
+const FORK_PERIOD: u64 = 10;
+/// ...this many times.
+const FORK_EPISODES: u64 = 3;
 const PROTOCOLS: [FinalityProtocol; 5] = [
     FinalityProtocol::Baseline,
     FinalityProtocol::SuiBaseline,
@@ -399,18 +401,41 @@ fn simulation_is_deterministic_per_seed() {
     }
 }
 
-/// Every validator but the first forks into a group of its own at every [`FORK_PERIOD`]-th
-/// height: one commitment per validator, so none reaches f+1 support.
+/// Every validator but the first forks into a group of its own at the first
+/// [`FORK_EPISODES`] multiples of [`FORK_PERIOD`]: one state per validator, so none reaches f+1
+/// support.
 fn fragmented(finality: FinalityProtocol) -> ValidatorParameters {
-    let groups = (1..COMMITTEE_SIZE)
-        .map(|index| vec![Authority::from(index)])
+    let groups: Vec<_> = (1..COMMITTEE_SIZE).map(|index| vec![index]).collect();
+    forking(finality, &groups, FORK_PERIOD, Some(FORK_EPISODES))
+}
+
+/// Forks the given groups of authorities every `period` heights, `episodes` times (every time
+/// if `None`).
+fn forking(
+    finality: FinalityProtocol,
+    groups: &[Vec<usize>],
+    period: u64,
+    episodes: Option<u64>,
+) -> ValidatorParameters {
+    let groups = groups
+        .iter()
+        .map(|group| group.iter().copied().map(Authority::from).collect())
         .collect();
-    let period = NonZeroU64::new(FORK_PERIOD).unwrap();
     ValidatorParameters {
         finality,
-        fork: Some(ForkInjection { groups, period }),
+        fork: Some(ForkInjection {
+            groups,
+            period: NonZeroU64::new(period).unwrap(),
+            episodes: episodes.map(|episodes| NonZeroU64::new(episodes).unwrap()),
+        }),
         ..Default::default()
     }
+}
+
+/// The forked heights among the first `minted`.
+fn forked_heights(minted: u64, period: u64, episodes: Option<u64>) -> u64 {
+    let forked = minted / period;
+    episodes.map_or(forked, |episodes| forked.min(episodes))
 }
 
 /// Runs the load generators until every validator executed [`TARGET_TRANSACTIONS`], then
@@ -506,8 +531,27 @@ fn last_decision(
     (decision.anchor(), decision.outcome(), proof)
 }
 
+/// Asserts that every validator holds the same store and has nothing pending.
+fn assert_converged(
+    results: &[(SequentialScheduler<FakeExecutor>, CheckpointCertifier)],
+    context: impl Display,
+) {
+    let (reference, _) = &results[0];
+    for (scheduler, certifier) in results {
+        assert_eq!(scheduler.store(), reference.store(), "{context}");
+        assert!(certifier.pending().next().is_none(), "{context}");
+    }
+}
+
+/// The skips among `log`'s decisions.
+fn skips(log: &BTreeMap<BlockReference, Outcome>) -> u64 {
+    log.values()
+        .filter(|outcome| **outcome == Outcome::Skip)
+        .count() as u64
+}
+
 #[test]
-fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
+fn real_forks_skip_only_forked_heights_and_stores_converge() {
     let protocols = [
         FinalityProtocol::A,
         FinalityProtocol::B,
@@ -527,6 +571,8 @@ fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
                 .zip(&decisions)
                 .zip(contiguous);
             for ((validator, &(finalized, skipped)), contiguous) in validators {
+                assert_eq!(validator.halted(), None, "{finality}");
+                assert_eq!(validator.metrics().retained_bytes().get(), 0, "{finality}");
                 assert_accounting_matches_histograms(validator);
                 assert_eq!(contiguous, (finalized, finalized, 0), "{finality}");
                 let skips = validator.metrics().checkpoint_finality_latency_s(SKIP);
@@ -541,18 +587,18 @@ fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
             }
             let results = committee.shutdown().await;
 
-            // Decisions follow the commit sequence: every validator skips the fragmented
-            // heights and finalizes the rest, proofs included except under C.
+            // Every validator recovered onto the same state, skipping exactly the forked
+            // heights (no recovery cascaded into a skip) and finalizing the rest.
+            assert_converged(&results, finality);
             let certifiers = results.iter().map(|(_, certifier)| certifier);
             let log = agreed_decisions(finality, certifiers, finality);
             let minted = log.len() as u64;
             assert!(
-                minted > FORK_PERIOD,
-                "the run must reach a fragmented height"
+                minted > FORK_PERIOD * FORK_EPISODES,
+                "the run must pass every forked height"
             );
-            let skips = log.values().filter(|outcome| **outcome == Outcome::Skip);
-            let skips = skips.count() as u64;
-            assert_eq!(skips, minted / FORK_PERIOD, "{finality}");
+            let skips = skips(&log);
+            assert_eq!(skips, FORK_EPISODES, "{finality}");
             let (_, reference) = &results[0];
             for (decided, (_, certifier)) in decisions.into_iter().zip(&results) {
                 assert_eq!(decided, (minted - skips, skips), "{finality}");
@@ -562,6 +608,139 @@ fn skipping_protocols_skip_fragmented_heights_and_finalize_the_rest() {
                     "{finality}"
                 );
             }
+        });
+    }
+}
+
+/// Runs a committee with `parameters` under load to quiescence, then asserts that every
+/// validator decided every height and converged; returns the agreed decisions.
+fn converging_run(
+    parameters: ValidatorParameters,
+    seed: u64,
+    context: impl Display + Send + 'static,
+) -> BTreeMap<BlockReference, Outcome> {
+    SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
+        let finality = parameters.finality;
+        let mut committee = generate_load(parameters).await;
+        committee.wait_for_decided().await;
+        for validator in committee.validators() {
+            assert_eq!(validator.halted(), None, "{context}");
+            // Recovery keeps nothing once every height is released.
+            assert_eq!(validator.metrics().retained_bytes().get(), 0, "{context}");
+        }
+        let results = committee.shutdown().await;
+        assert_converged(&results, &context);
+        let certifiers = results.iter().map(|(_, certifier)| certifier);
+        agreed_decisions(finality, certifiers, context)
+    })
+}
+
+/// Heights executed again after a recovery fork again: recovery repeats and still converges.
+#[test]
+fn repeated_recovery_converges() {
+    let groups: Vec<_> = (1..COMMITTEE_SIZE).map(|index| vec![index]).collect();
+    let parameters = forking(FinalityProtocol::A, &groups, 5, None);
+    let log = converging_run(parameters, 7, "every fifth height");
+    let minted = log.len() as u64;
+    assert!(minted > 5 * FORK_EPISODES);
+    assert_eq!(skips(&log), forked_heights(minted, 5, None));
+}
+
+/// A single liar is outvoted at every forked height: everyone finalizes, and the liar adopts
+/// the honest state.
+#[test]
+fn a_single_liar_is_overruled_and_adopts() {
+    for finality in PROTOCOLS {
+        let parameters = forking(finality, &[vec![3]], FORK_PERIOD, Some(FORK_EPISODES));
+        let log = converging_run(parameters, 7, finality);
+        assert!(log.len() as u64 > FORK_PERIOD * FORK_EPISODES, "{finality}");
+        assert_eq!(skips(&log), 0, "{finality}");
+    }
+}
+
+/// Half the committee forks together: f+1 on each side. A and B finalize whichever state f+1
+/// votes reach first, and the other side adopts it; C needs 2f+1 matching, so it skips.
+#[test]
+fn a_winning_group_is_adopted_by_the_rest() {
+    let protocols = [
+        FinalityProtocol::A,
+        FinalityProtocol::B,
+        FinalityProtocol::C,
+    ];
+    for finality in protocols {
+        let parameters = forking(finality, &[vec![1, 2]], FORK_PERIOD, Some(FORK_EPISODES));
+        let log = converging_run(parameters, 7, finality);
+        assert!(log.len() as u64 > FORK_PERIOD * FORK_EPISODES, "{finality}");
+        let expected = match finality {
+            FinalityProtocol::C => FORK_EPISODES,
+            _ => 0,
+        };
+        assert_eq!(skips(&log), expected, "{finality}");
+    }
+}
+
+/// The real-fork runs are deterministic per seed, recovery included.
+#[test]
+fn real_fork_runs_are_deterministic_per_seed() {
+    for seed in [7, 42] {
+        let run = || {
+            SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
+                let mut committee = generate_load(fragmented(FinalityProtocol::A)).await;
+                committee.wait_for_decided().await;
+                committee.shutdown().await
+            })
+        };
+        let (first, second) = (run(), run());
+        for ((a, a_certifier), (b, b_certifier)) in first.iter().zip(&second) {
+            assert_eq!(a.store(), b.store(), "seed {seed}");
+            assert_eq!(
+                a_certifier.decision_log(),
+                b_certifier.decision_log(),
+                "seed {seed}"
+            );
+        }
+    }
+}
+
+/// After a 4-way split no state reaches 2f+1 votes, so the baselines never decide the forked
+/// height nor anything after it, and every validator halts at the window cap.
+#[test]
+fn baselines_halt_after_a_real_fork() {
+    const WINDOW: u32 = 16;
+    for finality in [FinalityProtocol::Baseline, FinalityProtocol::SuiBaseline] {
+        SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {
+            let parameters = ValidatorParameters {
+                max_unstable_heights: WINDOW,
+                ..fragmented(finality)
+            };
+            let committee = SimulatedTestbed::start(parameters).await;
+            let generators: Vec<_> = committee
+                .validators()
+                .iter()
+                .map(|validator| {
+                    validator.start_load_generator(LoadGeneratorConfig::new_for_test())
+                })
+                .collect();
+            let mut waited = Duration::ZERO;
+            while committee.validators().iter().any(|v| v.halted().is_none()) {
+                assert!(waited < Duration::from_secs(120), "{finality}: no halt");
+                SimulatorContext::sleep(SUBMISSION_INTERVAL).await;
+                waited += SUBMISSION_INTERVAL;
+            }
+            for generator in &generators {
+                SimulatorContext::abort(generator);
+            }
+            let heights = WINDOW as usize;
+            for validator in committee.validators() {
+                let halted = validator.halted();
+                assert_eq!(halted, Some(HaltReason::UnstableHeights { heights }));
+                let halts = validator.metrics().halted(UNSTABLE_HEIGHTS).get();
+                assert_eq!(halts, 1, "{finality}");
+            }
+            let results = committee.shutdown().await;
+            let certifiers = results.iter().map(|(_, certifier)| certifier);
+            let log = agreed_decisions(finality, certifiers, finality);
+            assert_eq!(log.len() as u64, FORK_PERIOD - 1, "{finality}");
         });
     }
 }
@@ -787,7 +966,8 @@ fn fork_free_runs_never_wait_for_a_predecessor() {
 }
 
 /// With room for a single certificate in flight, own votes and certificates wait for own
-/// proposals, and C still decides every height, identically everywhere.
+/// proposals, recoveries' re-votes included, and C still decides every height, identically
+/// everywhere.
 #[test]
 fn own_proposals_respect_a_binding_protocol_budget() {
     SimulatorExecutor::run(StdRng::seed_from_u64(7), async move {

@@ -345,7 +345,7 @@ impl PendingCheckpoint {
 
 /// The bytes a skip of the height anchored at `anchor` folds into the canonical commitment:
 /// its author, round and digest.
-fn anchor_bytes(anchor: BlockReference) -> [u8; 48] {
+pub fn anchor_bytes(anchor: BlockReference) -> [u8; 48] {
     let mut bytes = [0; 48];
     bytes[..8].copy_from_slice(&(anchor.authority.index() as u64).to_be_bytes());
     bytes[8..16].copy_from_slice(&anchor.round.to_be_bytes());
@@ -363,8 +363,6 @@ pub struct CheckpointCertifier {
     watermark: Option<Decision>,
     /// The canonical commitment at the watermark: genesis's until the first release.
     canon: Digest,
-    /// Under the emulated fork injection: `canon` stays at genesis and nothing diverges.
-    emulated_forks: bool,
     /// The released height whose state diverged, until taken: nothing is released meanwhile.
     divergence: Option<Divergence>,
     /// Leaders per consensus round: an honest author votes for at most this many anchors of
@@ -406,7 +404,6 @@ impl CheckpointCertifier {
             pending: VecDeque::new(),
             watermark: None,
             canon: Digest::default(),
-            emulated_forks: false,
             divergence: None,
             leaders,
             cursor: Cursor::default(),
@@ -419,13 +416,6 @@ impl CheckpointCertifier {
             #[cfg(any(test, feature = "decision-log"))]
             decision_log: BTreeMap::new(),
         }
-    }
-
-    /// Under the emulated fork injection, votes name the genesis digest as their parent and a
-    /// skip changes no state: the canonical commitment stays at genesis and nothing diverges.
-    pub fn with_emulated_forks(mut self) -> Self {
-        self.emulated_forks = true;
-        self
     }
 
     pub fn protocol(&self) -> FinalityProtocol {
@@ -699,14 +689,12 @@ impl CheckpointCertifier {
                     "local checkpoint diverges from the finalized checkpoint"
                 );
             }
-            if !self.emulated_forks {
-                self.canon = match outcome {
-                    Outcome::Finalize(finalized) => finalized,
-                    Outcome::Skip => self.canon.skip(&anchor_bytes(anchor)),
-                };
-                if self.canon != local.commitment() {
-                    self.divergence = Some(Divergence { anchor, outcome });
-                }
+            self.canon = match outcome {
+                Outcome::Finalize(finalized) => finalized,
+                Outcome::Skip => self.canon.skip(&anchor_bytes(anchor)),
+            };
+            if self.canon != local.commitment() {
+                self.divergence = Some(Divergence { anchor, outcome });
             }
             #[cfg(any(test, feature = "decision-log"))]
             {
@@ -3074,26 +3062,5 @@ mod tests {
         let finalize = Outcome::Finalize(vote(1).commitment());
         assert_eq!(released(&mut live), [finalize]);
         assert_eq!(released(&mut recovered), [finalize]);
-    }
-
-    #[test]
-    fn emulated_fork_mode_never_diverges() {
-        // Under the emulated injection, commitments are this validator's own but every parent
-        // is genesis.
-        let mut certifier =
-            CheckpointCertifier::new_for_test(FinalityProtocol::A, vec![1; 4], 3, 0)
-                .with_emulated_forks();
-        let timings = CheckpointTimings::default();
-        certifier.push(vote(1).anchor(), local(1), Digest::default(), timings);
-        certifier.push(vote(2).anchor(), local(2), Digest::default(), timings);
-        skip_the_first(&mut certifier);
-        for author in 0..2 {
-            certifier.record(block(author, 2), vote_at(2, local(2), Digest::default()));
-        }
-        assert_eq!(
-            released(&mut certifier),
-            [Outcome::Skip, Outcome::Finalize(local(2))]
-        );
-        assert_eq!(certifier.take_divergence(), None);
     }
 }

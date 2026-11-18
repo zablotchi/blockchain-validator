@@ -115,6 +115,7 @@ mod tests {
             fork: Some(ForkInjection {
                 groups,
                 period: NonZeroU64::new(10).unwrap(),
+                episodes: None,
             }),
             phase_one_timeout: Duration::from_millis(250),
             evidence_budget_bytes: 1 << 30,

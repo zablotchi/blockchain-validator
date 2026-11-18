@@ -65,8 +65,8 @@ pub const DECISION_LATENCY_S: &str = "latency_s";
 pub const LABEL_REASON: &str = "reason";
 /// The retained state exceeded the evidence budget.
 pub const EVIDENCE_BUDGET: &str = "evidence_budget";
-/// The state diverged from the canonical one.
-pub const DIVERGENCE: &str = "divergence";
+/// No candidate state matches a finalized commitment this validator lost to.
+pub const NO_MATCHING_CANDIDATE: &str = "no_matching_candidate";
 /// The executed heights not yet released reached the window cap.
 pub const UNSTABLE_HEIGHTS: &str = "unstable_heights";
 
